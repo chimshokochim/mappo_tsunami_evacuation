@@ -1,0 +1,67 @@
+Action probabilities for agent_19 (destination=r0c3):
+  step   0 | at node r2c0  (5 option(s))
+      action 0: ->     r1c1   p=0.507  <== CHOSEN
+      action 1: ->     r2c1   p=0.334
+      action 2: ->     r1c0   p=0.092
+      action 3: ->     r3c1   p=0.034
+      action 4: ->     r3c0   p=0.010
+  step  50 | at node r1c1  (8 option(s))
+      action 0: ->     r0c2   p=0.533
+      action 1: ->     r1c2   p=0.315
+      action 2: ->     r0c1   p=0.087  <== CHOSEN
+      action 3: ->     r2c2   p=0.034
+      action 4: ->     r2c1   p=0.009
+      action 5: ->     r0c0   p=0.006
+      action 6: ->     r1c0   p=0.010
+      action 7: ->     r2c0   p=0.006
+  step  67 | at node r0c1  (5 option(s))
+      action 0: ->     r0c2   p=0.508
+      action 1: ->     r1c2   p=0.327  <== CHOSEN
+      action 2: ->     r1c1   p=0.095
+      action 3: ->     r0c0   p=0.036
+      action 4: ->     r1c0   p=0.010
+  step  90 | at node r1c2  (8 option(s))
+      action 0: ->     r0c3   p=0.517
+      action 1: ->     r0c2   p=0.310  <== CHOSEN
+      action 2: ->     r1c3   p=0.094
+      action 3: ->     r0c1   p=0.040
+      action 4: ->     r2c3   p=0.011
+      action 5: ->     r2c2   p=0.008
+      action 6: ->     r1c1   p=0.012
+      action 7: ->     r2c1   p=0.008
+  step 107 | at node r0c2  (5 option(s))
+      action 0: ->     r0c3   p=0.511
+      action 1: ->     r1c3   p=0.329  <== CHOSEN
+      action 2: ->     r1c2   p=0.093
+      action 3: ->     r0c1   p=0.034
+      action 4: ->     r1c1   p=0.010
+  step 130 | at node r1c3  (8 option(s))
+      action 0: ->     r0c3   p=0.527
+      action 1: ->     r0c2   p=0.309  <== CHOSEN
+      action 2: ->     r0c4   p=0.091
+      action 3: ->     r1c2   p=0.039
+      action 4: ->     r1c4   p=0.010
+      action 5: ->     r2c3   p=0.007
+      action 6: ->     r2c2   p=0.011
+      action 7: ->     r2c4   p=0.007
+  step 153 | at node r0c2  (5 option(s))
+      action 0: ->     r0c3   p=0.511
+      action 1: ->     r1c3   p=0.329
+      action 2: ->     r1c2   p=0.093  <== CHOSEN
+      action 3: ->     r0c1   p=0.034
+      action 4: ->     r1c1   p=0.010
+  step 170 | at node r1c2  (8 option(s))
+      action 0: ->     r0c3   p=0.516
+      action 1: ->     r0c2   p=0.310  <== CHOSEN
+      action 2: ->     r1c3   p=0.094
+      action 3: ->     r0c1   p=0.040
+      action 4: ->     r2c3   p=0.011
+      action 5: ->     r2c2   p=0.008
+      action 6: ->     r1c1   p=0.013
+      action 7: ->     r2c1   p=0.008
+  step 187 | at node r0c2  (5 option(s))
+      action 0: ->     r0c3   p=0.511  <== CHOSEN
+      action 1: ->     r1c3   p=0.329
+      action 2: ->     r1c2   p=0.093
+      action 3: ->     r0c1   p=0.034
+      action 4: ->     r1c1   p=0.010

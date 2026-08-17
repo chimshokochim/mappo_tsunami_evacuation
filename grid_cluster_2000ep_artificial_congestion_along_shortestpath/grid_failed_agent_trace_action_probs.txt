@@ -1,0 +1,22 @@
+Action probabilities for agent_2 (destination=r4c0):
+  step   0 | at node r0c2  (5 option(s))
+      action 0: ->     r1c1   p=0.885  <== CHOSEN
+      action 1: ->     r1c2   p=0.088
+      action 2: ->     r1c3   p=0.019
+      action 3: ->     r0c1   p=0.005
+      action 4: ->     r0c3   p=0.001
+  step  41 | at node r1c1  (8 option(s))
+      action 0: ->     r2c0   p=0.894  <== CHOSEN
+      action 1: ->     r2c1   p=0.081
+      action 2: ->     r2c2   p=0.018
+      action 3: ->     r1c0   p=0.005
+      action 4: ->     r1c2   p=0.001
+      action 5: ->     r0c0   p=0.000
+      action 6: ->     r0c1   p=0.001
+      action 7: ->     r0c2   p=0.000
+  step 143 | at node r2c0  (5 option(s))
+      action 0: ->     r3c0   p=0.903  <== CHOSEN
+      action 1: ->     r3c1   p=0.077
+      action 2: ->     r2c1   p=0.016
+      action 3: ->     r1c0   p=0.004
+      action 4: ->     r1c1   p=0.001

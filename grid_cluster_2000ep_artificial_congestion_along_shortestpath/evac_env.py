@@ -23,15 +23,12 @@ Reward Design:
     ratio        = density / DENSITY_MAX
     excess       = max(0, (ratio - CONGESTION_THRESHOLD) / (1 - CONGESTION_THRESHOLD))
     r_congestion = -CONGESTION_PENALTY * min(excess, 1.0)
-    CONGESTION_THRESHOLD = SPEED_FREE_DENSITY / DENSITY_MAX: congestion is
-    only "real" once it actually starts slowing people down, so the penalty
-    threshold is tied directly to the speed model's own free-flow cutoff
-    rather than set independently. Below it, the penalty is exactly zero --
-    lightly-used edges impose no avoidance pressure at all, so r_shape
-    (distance-to-destination progress) is the only signal driving the choice
-    among uncongested candidates. Above the threshold, the penalty ramps
-    back up to the same max magnitude as before at density=DENSITY_MAX. This
-    is meant to stop the policy from taking unnecessary detours around
+    Below CONGESTION_THRESHOLD (as a fraction of DENSITY_MAX), the penalty is
+    exactly zero -- lightly-used edges impose no avoidance pressure at all, so
+    r_shape (distance-to-destination progress) is the only signal driving the
+    choice among uncongested candidates. Above the threshold, the penalty
+    ramps back up to the same max magnitude as before at density=DENSITY_MAX.
+    This is meant to stop the policy from taking unnecessary detours around
     mild/negligible congestion, which was hurting arrival time/success rate
     relative to the shortest-path baseline despite scoring a better reward.
     Shelter capacity is NOT enforced (destinations are assigned ignoring
@@ -47,14 +44,9 @@ Reward Design:
 Movement / speed model:
   Each agent has its own basic_speed ~ N(AGENT_SPEED_MEAN, AGENT_SPEED_STD),
   clipped to [AGENT_SPEED_MIN, AGENT_SPEED_MAX], sampled once per episode.
-  Actual speed on an edge slows down with congestion following a Fruin-style
-  piecewise-linear pedestrian speed-density curve, using the PREVIOUS step's
-  observed density on that edge:
-    density <= SPEED_FREE_DENSITY : speed = basic_speed            (no slowdown)
-    density >= DENSITY_MAX        : speed = SPEED_MIN_ABS           (jam; same
-                                             for every agent, individual speed
-                                             differences vanish under a crowd)
-    otherwise                     : linear interpolation between the two
+  Actual speed on an edge slows down with congestion (Greenshields-style
+  linear model), using the PREVIOUS step's observed density on that edge:
+    speed = basic_speed * max(1 - density/DENSITY_MAX, V_MIN_RATIO)
   MOVE_DIST per step = speed * STEP_TIME.
 
 Artificial congestion (optional, off by default -- see __init__):
@@ -95,10 +87,7 @@ Observation Vector (dim = max_degree * 7 * 2 + 1), all features in [0, 1]:
     1: agent's own basic_speed / AGENT_SPEED_MAX        in [0,1]
     2: n_agents_on_edge / n_agents                      in [0,1]
     3: density (n_agents_on_edge / edge_area) / DENSITY_MAX   in [0,1]
-    4: piecewise_speed(agent's own basic_speed, density) / agent's own
-       basic_speed, in [SPEED_MIN_ABS/basic_speed, 1] (this agent's own
-       expected speed ratio on this edge, under the Fruin-style piecewise
-       speed-density curve -- see module docstring's Movement section)
+    4: max(1 - density/DENSITY_MAX, V_MIN_RATIO)   (avg edge speed / BASE_SPEED)
     5: density / DENSITY_MAX                            in [0,1]  (duplicate
        of feature 3, kept as a separate explicit feature per spec)
     6: closeness_to_target = 1 - dist_to_target(neighbor)/global_max_dist,
@@ -136,51 +125,25 @@ if not hasattr(builtins, 'profile'):
 
 # ── Reward / physics constants ─────────────────────────────────────────────────
 GAMMA_SHAPE        = 0.99
-CONGESTION_PENALTY = 0.50   # max per-step penalty for very congested links
+CONGESTION_PENALTY = 5.00   # max per-step penalty for very congested links
+CONGESTION_THRESHOLD = 0.5  # fraction of DENSITY_MAX below which congestion
+                             # is ignored entirely (no avoidance pressure);
+                             # penalty ramps from 0 at this threshold up to
+                             # -CONGESTION_PENALTY at density == DENSITY_MAX
 TIME_PENALTY       = 0.01   # small fixed penalty applied every step an agent
                              # is still evacuating, to discourage dawdling /
                              # taking unnecessarily long routes (same order of
                              # magnitude as r_shape/r_congestion, not raw STEP_TIME)
 STEP_TIME          = 5.0    # seconds per simulation step
 
-# ── Piecewise pedestrian speed-density model (Fruin-style) ─────────────────────
-# Below SPEED_FREE_DENSITY: no slowdown at all (free-flow, agent's own
-# basic_speed). Between SPEED_FREE_DENSITY and DENSITY_MAX (jam density):
-# speed decreases LINEARLY from basic_speed down to the shared floor
-# SPEED_MIN_ABS. At/above DENSITY_MAX: everyone moves at SPEED_MIN_ABS
-# regardless of their own basic_speed -- individual speed differences are
-# real at low density but get crowded out entirely once the road is jammed
-# (you can't out-walk the person in front of you). Replaces the old
-# multiplicative model (speed = basic_speed * ratio), which kept each
-# agent's relative speed advantage even at full jam density, unrealistically.
-SPEED_FREE_DENSITY = 0.5    # agents/m^2; at/below this, zero slowdown
-DENSITY_MAX        = 1.0    # agents/m^2; jam density -- at/above this,
-                             # speed = SPEED_MIN_ABS for every agent
-SPEED_MIN_ABS      = 0.01    # m/s; common floor speed at jam density,
-                             # independent of any agent's own basic_speed
-
-# Congestion is only "real" (worth avoiding / penalizing) once it actually
-# starts slowing people down, so this threshold is tied directly to
-# SPEED_FREE_DENSITY rather than set independently.
-CONGESTION_THRESHOLD = SPEED_FREE_DENSITY / DENSITY_MAX
-
+DENSITY_MAX        = 1.4    # jam density (agents/m^2); used for both the
+                             # Greenshields speed model and density normalization
+V_MIN_RATIO        = 0.1    # minimum speed fraction of an agent's basic_speed,
+                             # even at jam density (prevents total gridlock)
 AGENT_SPEED_MEAN   = 1.2    # per-agent basic walking speed distribution (m/s)
 AGENT_SPEED_STD    = 0.2
 AGENT_SPEED_MIN    = 0.6
 AGENT_SPEED_MAX    = 1.8
-
-
-def _piecewise_speed(basic_speed, density):
-    """Fruin-style piecewise-linear speed-density curve (see constants
-    above): flat at basic_speed below SPEED_FREE_DENSITY, flat at
-    SPEED_MIN_ABS at/above DENSITY_MAX (jam), linear interpolation between
-    the two in between. basic_speed can be a scalar or a numpy array."""
-    if density <= SPEED_FREE_DENSITY:
-        return basic_speed
-    if density >= DENSITY_MAX:
-        return SPEED_MIN_ABS
-    frac = (density - SPEED_FREE_DENSITY) / (DENSITY_MAX - SPEED_FREE_DENSITY)
-    return basic_speed - frac * (basic_speed - SPEED_MIN_ABS)
 
 # Agent status codes
 STATUS_EVACUATING = np.int8(0)
@@ -559,7 +522,7 @@ class EvacuationEnv(_Base):
             prev_cnt = self._current_link_use.get((cidx, nidx), 0)
             area     = self.edge_area.get((cidx, nidx), ROAD_WIDTH)
             density  = self._eff_density(cidx, nidx, prev_cnt, area)
-            speed    = _piecewise_speed(float(self._agent_speed[i]), density)
+            speed    = float(self._agent_speed[i]) * max(1.0 - density / DENSITY_MAX, V_MIN_RATIO)
             self._agent_link_progress[i] += speed * STEP_TIME
             link_use[(cidx, nidx)] += 1
 
@@ -584,14 +547,14 @@ class EvacuationEnv(_Base):
             phi_next     = -float(self._shelter_dist[target, nidx]) / self._global_max_dist
             phi_curr     = -float(self._shelter_dist[target, cidx]) / self._global_max_dist
             r_shape      = GAMMA_SHAPE * phi_next - phi_curr
-            # r_shape      = 10.0 * r_shape
+            r_shape      = 10.0 * r_shape
             # r_shape      = 10.0 * (phi_next - phi_curr)
             area         = self.edge_area.get((cidx, nidx), ROAD_WIDTH)
             density      = self._eff_density(cidx, nidx, link_use.get((cidx, nidx), 0), area)
             density_ratio = density / DENSITY_MAX
             congestion_excess = max(0.0, (density_ratio - CONGESTION_THRESHOLD) / (1.0 - CONGESTION_THRESHOLD))
             r_congestion = -CONGESTION_PENALTY * min(congestion_excess, 1.0)
-            r_time       = -TIME_PENALTY
+            r_time       = -0.1 * TIME_PENALTY
 
             target_node_idx = int(self._shelter_node_idx[target])
             if not self._agent_on_link[i] and nidx == target_node_idx:
@@ -651,7 +614,7 @@ class EvacuationEnv(_Base):
             self._obs_mat[i, base + 1] = min(own_speed / AGENT_SPEED_MAX, 1.0)
             self._obs_mat[i, base + 2] = min(cnt / self.n_agents, 1.0)
             self._obs_mat[i, base + 3] = min(density / DENSITY_MAX, 1.0)
-            self._obs_mat[i, base + 4] = _piecewise_speed(own_speed, density) / own_speed
+            self._obs_mat[i, base + 4] = max(1.0 - density / DENSITY_MAX, V_MIN_RATIO)
             self._obs_mat[i, base + 5] = min(density / DENSITY_MAX, 1.0)
             self._obs_mat[i, base + 6] = max(closeness, 0.0)
 
@@ -717,7 +680,7 @@ class EvacuationEnv(_Base):
                 speeds.append(min(mean_speed / AGENT_SPEED_MAX, 1.0))
                 counts.append(min(cnt / self.n_agents, 1.0))
                 densities.append(min(density / DENSITY_MAX, 1.0))
-                speed_ratios.append(_piecewise_speed(mean_speed, density) / mean_speed)
+                speed_ratios.append(max(1.0 - density / DENSITY_MAX, V_MIN_RATIO))
                 density_ratios.append(min(density / DENSITY_MAX, 1.0))
                 if density >= 0.8 * DENSITY_MAX: hi80 += 1
                 if density >= 0.5 * DENSITY_MAX: hi50 += 1

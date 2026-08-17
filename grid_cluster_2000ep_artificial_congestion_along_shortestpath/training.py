@@ -60,8 +60,8 @@ CLUSTER_CENTER_POOL         = None   # None = no geographic restriction
 # rather than only transient crowding. See EvacuationEnv's docstring for
 # details. Off by default.
 ARTIFICIAL_CONGESTION           = True
-ARTIFICIAL_CONGESTION_LEVELS    = (1.0,)   # fractions of DENSITY_MAX
-ARTIFICIAL_CONGESTION_FRACTION  = 0.50         # fraction of edges affected (random mode only)
+ARTIFICIAL_CONGESTION_LEVELS    = (0.5, 0.8)   # fractions of DENSITY_MAX
+ARTIFICIAL_CONGESTION_FRACTION  = 0.15         # fraction of edges affected (random mode only)
 
 # If True, instead of random edges, congestion is placed ON the route the
 # greedy shortest-path (action-0) baseline would actually take (cluster
