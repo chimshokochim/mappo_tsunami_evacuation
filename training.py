@@ -38,7 +38,7 @@ LR_CRITIC      = 1e-3  # Adam learning rate for Critic (higher: faster value lea
 GAE_LAMBDA     = 0.95  # GAE smoothing factor (0=TD, 1=MC)
 CLIP_EPSILON   = 0.2   # PPO clipping range for policy ratio
 UPDATE_EPOCHS  = 4     # number of gradient passes per rollout buffer
-ENTROPY_COEF   = 0.01  # weight on entropy bonus (encourages exploration)
+ENTROPY_COEF   = 0.05  # weight on entropy bonus (encourages exploration)
 
 # ── Clustered start (see evac_env.EvacuationEnv) ────────────────────────────────
 # Every episode, all agents start within CLUSTER_RADIUS_HOPS hops of one
@@ -88,12 +88,88 @@ GRID_N_AGENTS            = 3000
 GRID_MAX_STEPS           = 200
 GRID_CLUSTER_RADIUS_HOPS = 2         # grid diameter is only ~4 hops (8-connected)
 
+# ── Minimal "line" topology: one center node, one edge to a near shelter, ──────
+# one edge to a far shelter (common.build_line_graph). Simplest possible
+# setting to test whether MAPPO learns to split traffic across both routes
+# under congestion, vs. shortest-path which always sends everyone down the
+# near (shorter) edge. Takes priority over USE_GRID_MAP when True. All 3000
+# agents start at 'center' (forced via cluster_start with a single-node
+# pool below) and depart with staggered timing (see STAGGERED_DEPARTURE).
+USE_LINE_MAP             = True
+LINE_DIST_NEAR           = 150.0    # meters, center -> shelter_near
+LINE_DIST_FAR            = 300.0    # meters, center -> shelter_far (~1:2 ratio)
+LINE_N_AGENTS            = 3000
+# NOTE: with only 2 narrow edges carrying all 3000 agents (no alternate
+# routes, no capacity limit other than the Greenshields speed slowdown),
+# congestion is severe: under the shortest-path baseline it takes ~800+
+# steps for everyone to fully clear the edges (verified by direct
+# simulation). A short max_steps (e.g. 150) would time out ~85% of agents
+# every single episode, giving no useful learning signal. 900 gives the
+# baseline enough room to mostly finish while still leaving real headroom
+# for a smarter (or worse) policy to differ from it.
+LINE_MAX_STEPS           = 900
+
+# Staggered departure: each agent gets its own random departure step instead
+# of everyone leaving 'center' at step 0, so agents arrive at the fork
+# spread out over time rather than all at once. Only wired up for the line
+# map for now (see EvacuationEnv's staggered_departure docstring).
+STAGGERED_DEPARTURE      = True
+DEPARTURE_WINDOW_FRAC    = 0.25     # everyone has departed by 25% of max_steps
+
+# If True, everyone's initial target is the single nearest shelter (here:
+# shelter_near, since everyone starts at 'center') instead of a random
+# 50/50 split -- so the shortest-path baseline piles 100% of agents onto
+# one route, giving MAPPO room to learn to send some agents to the
+# farther-but-less-congested shelter instead (re-targeting happens
+# automatically in evac_env.py's step() whenever an agent chooses to walk
+# onto an edge leading to a shelter -- see nearest_shelter_target
+# docstring). Only wired up for the line map for now.
+LINE_NEAREST_SHELTER_TARGET = True
+
+# If True, the Critic's global state is the minimal 3-dim
+# [density_near, density_far, frac_evacuating] instead of the default
+# 9-dim state (6 edge features averaged over ALL edges + hi80 + hi50 +
+# frac_evacuating). Averaging over just 2 edges hides exactly which one
+# is congested, which is the "Critic is too coarse-grained" issue --
+# giving it the two densities separately should produce a less noisy
+# value estimate (and thus a less noisy advantage/PPO gradient) right
+# when it matters most: whenever near and far have different congestion
+# levels. See EvacuationEnv's line_critic_state docstring for why the
+# other 4 raw features and the hi80/hi50 flags were dropped rather than
+# just also split per-edge. Only wired up for the line map for now.
+LINE_CRITIC_STATE = True
+
+# The shortest-path baseline re-runs TOTAL_EPISODES full episodes with
+# env.step() called unconditionally every tick (see
+# evaluate_shortest_path_baseline()'s docstring) -- on the line map this
+# routinely takes as long as (or longer than) training itself, especially
+# once congestion is severe enough that it times out every episode. Set to
+# False to skip it entirely and just train MAPPO -- arrival_time.png /
+# mappo_reward_analysis.png / shelter_choice.png will only show the
+# trained policy (no green/purple baseline lines), and
+# plot_line_zoom.py works unchanged either way since it never reads the
+# baseline_* fields. Re-enable when you actually need the baseline number
+# for comparison.
+RUN_BASELINE = False
+
+# The baseline has no learning, so its per-episode results are just noise
+# around a fixed level -- there's no trend to capture by running it for as
+# many episodes as training. BASELINE_N_EPISODES lets you run only a small
+# number of episodes (e.g. 10), average their results, and use that flat
+# average as the baseline value for every episode on the plots (instead of
+# 4000 separately-simulated, individually noisy baseline episodes). Set to
+# None (or >= TOTAL_EPISODES) to run the baseline for the full
+# TOTAL_EPISODES instead, e.g. if you want to see its own episode-to-episode
+# variance rather than just a flat reference line.
+BASELINE_N_EPISODES = 10
+
 from common import (
     OSM_FILE, EXCEL_FILE,
     N_TRAIN_AGENTS, TOTAL_EPISODES, MAX_STEPS_EP,
     REWARD_DEST, GAMMA, SEED,
     parse_osm, load_evac_data, build_graph_index, compute_shelter_distances,
     build_grid_graph, make_grid_evac_data,
+    build_line_graph, make_line_evac_data,
 )
 from evac_env import EvacuationEnv
 
@@ -122,7 +198,9 @@ class Critic(nn.Module):
     """
     Centralized value network (CTDE: Centralized Training, Decentralized Execution).
     Sees the full global state during training to estimate V(s).
-    Input:  global state (9,)
+    Input:  global state (9,) by default, or (3,) when the env's
+            line_critic_state=True (see EvacuationEnv.global_state_dim /
+            LINE_CRITIC_STATE below).
     Output: scalar state value V(s)
     """
     def __init__(self, global_state_dim=9):
@@ -138,7 +216,7 @@ class Critic(nn.Module):
 # ═══════════════════════════════════════════════════════════════════════════════
 class MAPPOAgent:
     """Holds Actor + Critic networks and their optimizers."""
-    def __init__(self, n_agents, n_nodes, max_degree, neighbor_lists):
+    def __init__(self, n_agents, n_nodes, max_degree, neighbor_lists, global_state_dim=9):
         self.n_agents       = n_agents
         self.n_nodes        = n_nodes
         self.max_degree     = max_degree
@@ -146,7 +224,7 @@ class MAPPOAgent:
 
         obs_dim = max_degree * 7 * 2 + 1   # current-node edge block(7*d) + destination-node edge block(7*d) + progress
         self.actor  = Actor(obs_dim, max_degree).to(device)
-        self.critic = Critic(9).to(device)
+        self.critic = Critic(global_state_dim).to(device)
         self.optimizer_actor  = optim.Adam(self.actor.parameters(),  lr=LR_ACTOR)
         self.optimizer_critic = optim.Adam(self.critic.parameters(), lr=LR_CRITIC)
 
@@ -208,6 +286,27 @@ def compute_gae(next_value, rewards, masks, values):
         last_val = val_arr[step]
     return returns.tolist()
 
+def _far_shelter_fraction(summary):
+    """
+    Diagnostic helper (line-map only): fraction of THIS episode's arrivals
+    that ended up at 'shelter_far' rather than 'shelter_near', using the
+    arrival_shelter_counts / shelter_list fields evac_env.py's summary()
+    now returns. Returns nan if this env has no 'shelter_far' (e.g. grid/
+    real map) or nobody arrived this episode. Used to check whether the
+    trained policy's near/far split actually changes over training, or
+    stays fixed at whatever an untrained (near-uniform-softmax) policy's
+    initial split happens to be.
+    """
+    shelter_list = summary.get('shelter_list')
+    counts       = summary.get('arrival_shelter_counts')
+    if not shelter_list or 'shelter_far' not in shelter_list:
+        return float('nan')
+    total = sum(counts)
+    if total == 0:
+        return float('nan')
+    far_idx = shelter_list.index('shelter_far')
+    return counts[far_idx] / total
+
 def evaluate_shortest_path_baseline(env, total_episodes, base_seed):
     """
     Run a no-learning baseline: every agent always picks action 0, i.e. the
@@ -223,6 +322,7 @@ def evaluate_shortest_path_baseline(env, total_episodes, base_seed):
     baseline_with_timeout = []
     baseline_counts       = []
     baseline_rewards      = []   # mean per-agent return per episode, same metric as history_rewards
+    baseline_far_frac     = []   # diagnostic: fraction of arrivals at shelter_far (line map only)
     for ep in range(total_episodes):
         t0 = time.time()
         env.reset(seed=base_seed + ep)
@@ -238,6 +338,7 @@ def evaluate_shortest_path_baseline(env, total_episodes, base_seed):
         baseline_with_timeout.append(summary['avg_arrival_time_with_timeout'])
         baseline_counts.append((summary['n_arrived'], summary['n_agents']))
         baseline_rewards.append(ep_reward / env.n_agents)
+        baseline_far_frac.append(_far_shelter_fraction(summary))
         ep_duration = time.time() - t0
 
         recent_arrived = [t for t in baseline_arrived_only[-50:] if not np.isnan(t)]
@@ -247,7 +348,8 @@ def evaluate_shortest_path_baseline(env, total_episodes, base_seed):
         print(f"[Baseline] Episode {ep:4d} | Avg Reward (per-agent): {avg_rew:7.2f} | "
               f"Avg Arrival Time (arrived, 50ep): {avg_arr:6.1f}s | "
               f"Arrived: {n_arr}/{n_tot} | Speed: {ep_duration:.1f}s/ep")
-    return baseline_arrived_only, baseline_with_timeout, baseline_counts, baseline_rewards
+    return (baseline_arrived_only, baseline_with_timeout, baseline_counts, baseline_rewards,
+            baseline_far_frac)
 
 def ppo_update(agent_system, memory):
     """
@@ -261,6 +363,12 @@ def ppo_update(agent_system, memory):
       surr2     = clip(ratio, 1±ε) * A
       loss      = -min(surr1, surr2) - entropy_coef * H(π)
     Advantages are normalized per batch to stabilize gradient scale.
+
+    Returns a dict of this episode's loss/entropy diagnostics (mean and
+    last-epoch value across the UPDATE_EPOCHS passes), for logging --
+    lets you check whether the Critic is actually converging (loss
+    trending down) or diverging/oscillating, and whether the Actor's
+    policy entropy is collapsing too fast or staying too high.
     """
     obs_batch      = torch.FloatTensor(np.array(memory['obs'])).to(device)
     state_per_step = torch.FloatTensor(np.array(memory['state_per_step'])).to(device)
@@ -270,6 +378,15 @@ def ppo_update(agent_system, memory):
     actions_batch  = torch.LongTensor(np.array(memory['actions'])).to(device)
     logprobs_batch = torch.FloatTensor(np.array(memory['logprobs'])).to(device)
     returns_batch  = torch.FloatTensor(np.array(memory['returns'])).to(device)
+
+    # Per-epoch loss/entropy history, returned to the caller for logging/
+    # diagnostics -- lets us see whether the Critic is actually converging
+    # (loss_critic trending down within/across episodes) or diverging/
+    # oscillating, and whether the Actor's entropy is collapsing too fast
+    # (policy locking in early) or staying high (never committing).
+    critic_losses  = []
+    actor_losses   = []
+    entropies      = []
 
     for _ in range(UPDATE_EPOCHS):
         # ── Critic update ──────────────────────────────────────────────────
@@ -290,6 +407,19 @@ def ppo_update(agent_system, memory):
         agent_system.optimizer_actor.zero_grad()
         loss_actor.backward()
         agent_system.optimizer_actor.step()
+
+        critic_losses.append(float(loss_critic.item()))
+        actor_losses.append(float(loss_actor.item()))
+        entropies.append(float(dist_entropy.mean().item()))
+
+    return dict(
+        critic_loss_mean=float(np.mean(critic_losses)),
+        critic_loss_last=critic_losses[-1],
+        actor_loss_mean=float(np.mean(actor_losses)),
+        actor_loss_last=actor_losses[-1],
+        entropy_mean=float(np.mean(entropies)),
+        entropy_last=entropies[-1],
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Utilities
@@ -318,8 +448,30 @@ def train():
     print(" Training Phase [Multi-Agent PPO]")
     print("=" * 60)
 
-    # ── Map source: real Kochi OSM map, or a small synthetic grid ────────────
-    if USE_GRID_MAP:
+    # ── Map source: real Kochi OSM map, a small synthetic grid, or the ───────
+    # minimal center/near-shelter/far-shelter "line" topology ────────────────
+    train_staggered_departure    = False
+    train_departure_window_frac  = DEPARTURE_WINDOW_FRAC
+    train_cluster_center_pool    = CLUSTER_CENTER_POOL
+    train_nearest_shelter_target = False
+    train_line_critic_state      = False
+    if USE_LINE_MAP:
+        print(f"Using minimal line topology (center -> shelter_near @ "
+              f"{LINE_DIST_NEAR:.0f}m, center -> shelter_far @ {LINE_DIST_FAR:.0f}m) "
+              f"instead of the OSM/grid map.")
+        node_coords, adj, road_nodes = build_line_graph(
+            dist_near=LINE_DIST_NEAR, dist_far=LINE_DIST_FAR)
+        evac_nodes, evac_capacity = make_line_evac_data()
+        train_n_agents       = LINE_N_AGENTS
+        train_max_steps      = LINE_MAX_STEPS
+        train_cluster_radius = 0   # forces all agents to start exactly at 'center'
+        train_cluster_center_pool   = ['center']
+        train_staggered_departure   = STAGGERED_DEPARTURE
+        train_nearest_shelter_target = LINE_NEAREST_SHELTER_TARGET
+        train_line_critic_state      = LINE_CRITIC_STATE
+        graph_save_path       = 'graph_data_line.pkl'
+        model_prefix          = 'mappo_line'
+    elif USE_GRID_MAP:
         print(f"Using synthetic {GRID_ROWS}x{GRID_COLS} grid map "
               f"({'8' if GRID_CONNECT_DIAGONALS else '4'}-connected) instead of the OSM map.")
         node_coords, adj, road_nodes = build_grid_graph(
@@ -362,29 +514,39 @@ def train():
         node_list=node_list, node_to_idx=node_to_idx,
         neighbor_lists=neighbor_lists, max_degree=max_degree,
         n_agents=train_n_agents, max_steps=train_max_steps, reward_dest=REWARD_DEST,
-        cluster_start=CLUSTER_START, cluster_radius_hops=train_cluster_radius,
-        cluster_center_pool=CLUSTER_CENTER_POOL,
-        artificial_congestion=ARTIFICIAL_CONGESTION,
+        cluster_start=(CLUSTER_START or USE_LINE_MAP), cluster_radius_hops=train_cluster_radius,
+        cluster_center_pool=train_cluster_center_pool,
+        artificial_congestion=(ARTIFICIAL_CONGESTION and not USE_LINE_MAP),
         artificial_congestion_levels=ARTIFICIAL_CONGESTION_LEVELS,
         artificial_congestion_fraction=ARTIFICIAL_CONGESTION_FRACTION,
         artificial_congestion_target_shortest_path=ARTIFICIAL_CONGESTION_TARGET_SHORTEST_PATH,
         artificial_congestion_sp_fraction=ARTIFICIAL_CONGESTION_SP_FRACTION,
+        staggered_departure=train_staggered_departure,
+        departure_window_frac=train_departure_window_frac,
+        nearest_shelter_target=train_nearest_shelter_target,
+        line_critic_state=train_line_critic_state,
     )
 
-    mappo_brain = MAPPOAgent(train_n_agents, n_nodes, max_degree, neighbor_lists)
+    mappo_brain = MAPPOAgent(train_n_agents, n_nodes, max_degree, neighbor_lists,
+                              global_state_dim=env.global_state_dim)
 
     # Sanity-check network sizes at startup
     actor_params  = sum(p.numel() for p in mappo_brain.actor.parameters())
     critic_params = sum(p.numel() for p in mappo_brain.critic.parameters())
     print(f"  Actor : {actor_params:,} params = {actor_params*4/1e6:.2f}MB "
           f"(obs_dim={max_degree*7*2+1})")
-    print(f"  Critic: {critic_params:,} params = {critic_params*4/1e6:.2f}MB")
+    print(f"  Critic: {critic_params:,} params = {critic_params*4/1e6:.2f}MB "
+          f"(global_state_dim={env.global_state_dim})")
 
     # ── Training loop ────────────────────────────────────────────────────────
     arrival_arrived_only = []   # avg arrival time (s), arrived agents only, per episode
     arrival_with_timeout = []   # avg arrival time (s), timeouts counted as max_steps, per episode
     arrival_counts       = []   # (n_arrived, n_agents) per episode
     history_rewards       = []   # mean per-agent return per episode (for plotting)
+    history_far_frac      = []   # diagnostic: fraction of arrivals at shelter_far (line map only)
+    history_critic_loss   = []   # diagnostic: mean Critic MSE loss this episode's PPO update
+    history_actor_loss    = []   # diagnostic: mean Actor clipped-surrogate loss this episode
+    history_entropy       = []   # diagnostic: mean policy entropy this episode
     total_t0 = time.time()
 
     for ep in range(TOTAL_EPISODES):
@@ -402,12 +564,19 @@ def train():
             active_idxs = np.where(active_mask)[0]
 
             if len(active_idxs) == 0:
-                # All evacuating agents are mid-link; advance simulation with no new decisions
-                next_obs_mat, active_mask, _, _, truncations, infos = \
+                # All evacuating agents are mid-link; advance simulation with no new decisions.
+                # Rewards are still generated for every evacuating agent this
+                # step (env.step() doesn't gate them on active_idxs), so they
+                # must still be added to ep_reward here -- otherwise every
+                # step where nobody happens to need a fresh decision silently
+                # drops its reward, making ep_reward an undercount of the
+                # real per-agent time penalty (this was the previous bug).
+                next_obs_mat, active_mask, rewards, _, truncations, infos = \
                     env.step(env._actions_arr)
                 if infos:
                     next_state = next(iter(infos.values()))['global_state']
                 obs_mat = next_obs_mat; state = next_state
+                ep_reward += sum(rewards.values())
                 if not env.agents or any(truncations.values()): break
                 continue
 
@@ -444,12 +613,17 @@ def train():
             if not env.agents or any(truncations.values()): break
 
         # ── End of episode: compute returns and update networks ───────────────
+        loss_info = None
         if len(memory['rewards']) > 0:
             next_value        = mappo_brain.critic(
                 torch.from_numpy(next_state).to(device)).item()
             memory['returns'] = compute_gae(next_value, memory['rewards'],
                                             memory['masks'], memory['values'])
-            ppo_update(mappo_brain, memory)
+            loss_info = ppo_update(mappo_brain, memory)
+
+        history_critic_loss.append(loss_info['critic_loss_mean'] if loss_info else float('nan'))
+        history_actor_loss.append(loss_info['actor_loss_mean'] if loss_info else float('nan'))
+        history_entropy.append(loss_info['entropy_mean'] if loss_info else float('nan'))
 
         summary = env.summary()
         arrival_arrived_only.append(summary['avg_arrival_time_arrived_only'])
@@ -457,26 +631,61 @@ def train():
         arrival_counts.append((summary['n_arrived'], summary['n_agents']))
         mean_ep_reward = ep_reward / train_n_agents
         history_rewards.append(mean_ep_reward)
+        far_frac = _far_shelter_fraction(summary)
+        history_far_frac.append(far_frac)
         ep_duration = time.time() - t0
 
         recent_arrived = [t for t in arrival_arrived_only[-50:] if not np.isnan(t)]
         avg_arr = np.mean(recent_arrived) if recent_arrived else float('nan')
         avg_rew = np.mean(history_rewards[-50:])
         n_arr, n_tot = arrival_counts[-1]
+        far_frac_txt = f" | Far-shelter frac: {far_frac:.2f}" if not np.isnan(far_frac) else ""
+        loss_txt = (f" | Critic loss: {loss_info['critic_loss_mean']:.4f} | "
+                    f"Actor loss: {loss_info['actor_loss_mean']:.4f} | "
+                    f"Entropy: {loss_info['entropy_mean']:.3f}") if loss_info else ""
         print(f"Episode {ep:4d} | Avg Reward (per-agent): {avg_rew:7.2f} | "
               f"Avg Arrival Time (arrived, 50ep): {avg_arr:6.1f}s | "
-              f"Arrived: {n_arr}/{n_tot} | Speed: {ep_duration:.1f}s/ep")
+              f"Arrived: {n_arr}/{n_tot} | Speed: {ep_duration:.1f}s/ep{far_frac_txt}{loss_txt}")
 
     total_duration = time.time() - total_t0
     print(f"Training Complete in {total_duration / 60:.2f} minutes.")
     _save_model(mappo_brain, path_prefix=model_prefix)
 
     # ── Shortest-path (no-learning) baseline, same per-episode seeds ─────────
-    print("Running shortest-path baseline for comparison...")
-    t0 = time.time()
-    baseline_arrived_only, baseline_with_timeout, baseline_counts, baseline_rewards = \
-        evaluate_shortest_path_baseline(env, TOTAL_EPISODES, SEED)
-    print(f"  Baseline Complete in {(time.time() - t0) / 60:.2f} minutes.")
+    if RUN_BASELINE:
+        n_baseline_ep = (BASELINE_N_EPISODES
+                          if BASELINE_N_EPISODES and BASELINE_N_EPISODES < TOTAL_EPISODES
+                          else TOTAL_EPISODES)
+        flat = n_baseline_ep < TOTAL_EPISODES
+        print(f"Running shortest-path baseline for comparison "
+              f"({n_baseline_ep} episode{'s' if n_baseline_ep != 1 else ''}"
+              f"{', averaged into a flat line' if flat else ''})...")
+        t0 = time.time()
+        baseline_arrived_only, baseline_with_timeout, baseline_counts, baseline_rewards, baseline_far_frac = \
+            evaluate_shortest_path_baseline(env, n_baseline_ep, SEED)
+        print(f"  Baseline Complete in {(time.time() - t0) / 60:.2f} minutes.")
+
+        if flat:
+            # No learning happens in the baseline, so its per-episode
+            # results are pure noise around a fixed level -- average the
+            # small sample and broadcast that flat value across every
+            # training episode, instead of running/plotting TOTAL_EPISODES
+            # separately-simulated (and individually noisy) baseline runs.
+            mean_arrived  = float(np.nanmean(baseline_arrived_only))
+            mean_timeout  = float(np.nanmean(baseline_with_timeout))
+            mean_reward   = float(np.nanmean(baseline_rewards))
+            mean_far_frac = float(np.nanmean(baseline_far_frac))
+            mean_n_arr    = float(np.mean([c[0] for c in baseline_counts]))
+            mean_n_tot    = baseline_counts[0][1]
+            baseline_arrived_only = [mean_arrived] * TOTAL_EPISODES
+            baseline_with_timeout = [mean_timeout] * TOTAL_EPISODES
+            baseline_rewards      = [mean_reward] * TOTAL_EPISODES
+            baseline_far_frac     = [mean_far_frac] * TOTAL_EPISODES
+            baseline_counts       = [(mean_n_arr, mean_n_tot)] * TOTAL_EPISODES
+    else:
+        print("RUN_BASELINE=False -- skipping shortest-path baseline.")
+        baseline_arrived_only = baseline_with_timeout = baseline_counts = None
+        baseline_rewards      = baseline_far_frac                       = None
 
     # ── Persist raw per-episode histories so they can be re-plotted later ────
     # (e.g. a custom moving-average window) without re-running training.
@@ -487,22 +696,31 @@ def train():
             arrival_with_timeout=arrival_with_timeout,
             arrival_counts=arrival_counts,
             history_rewards=history_rewards,
+            history_far_frac=history_far_frac,
+            history_critic_loss=history_critic_loss,
+            history_actor_loss=history_actor_loss,
+            history_entropy=history_entropy,
             baseline_arrived_only=baseline_arrived_only,
             baseline_with_timeout=baseline_with_timeout,
             baseline_counts=baseline_counts,
             baseline_rewards=baseline_rewards,
+            baseline_far_frac=baseline_far_frac,
             total_episodes=TOTAL_EPISODES,
         ), f)
     print(f"  Raw per-episode history saved: {history_path}")
 
     return (mappo_brain, arrival_arrived_only, arrival_with_timeout, arrival_counts,
             history_rewards, baseline_arrived_only, baseline_with_timeout, baseline_counts,
-            baseline_rewards)
+            baseline_rewards, history_far_frac, baseline_far_frac,
+            history_critic_loss, history_actor_loss, history_entropy)
 
 def plot_training_results(arrival_arrived_only, arrival_with_timeout, arrival_counts,
                            mean_episode_rewards,
                            baseline_arrived_only=None, baseline_with_timeout=None,
-                           baseline_counts=None, baseline_rewards=None):
+                           baseline_counts=None, baseline_rewards=None,
+                           history_far_frac=None, baseline_far_frac=None,
+                           history_critic_loss=None, history_actor_loss=None,
+                           history_entropy=None):
     """Plot and save two training curves: average arrival time (vs. a
     shortest-path/no-learning baseline run with the same per-episode
     start/target seeds) and mean episode return."""
@@ -587,14 +805,97 @@ def plot_training_results(arrival_arrived_only, arrival_with_timeout, arrival_co
             ax.plot(np.arange(window, len(baseline_rewards) + 1), ma_b,
                     '--', color='darkgreen', lw=2, label=f'Baseline: {window}-ep moving avg')
     ax.set_xlabel('Episode'); ax.set_ylabel('Mean Episode Return')
-    ax.set_title('Mean Episode Return per Episode\n(r_shape + r_congestion + r_terminal, averaged over all agents)')
+    ax.set_title('Mean Episode Return per Episode averaged over all agents')
     ax.legend(fontsize=9); ax.grid(True, alpha=0.3)
     plt.tight_layout(); plt.savefig('mappo_reward_analysis.png', dpi=150); plt.close()
     print("  Mean Episode Return Plot Saved: mappo_reward_analysis.png")
 
+    # ── Diagnostic: fraction of arrivals at shelter_far, per episode ─────────
+    # (line map only -- nan/absent on grid/real map). Lets you see directly
+    # whether the near/far split is actually changing as training
+    # progresses, vs. staying fixed at whatever an untrained policy's
+    # initial (near-uniform-softmax) action distribution happens to
+    # produce -- which the reward/arrival-time curves alone can't show,
+    # since a flat curve there is ambiguous between "converged" and
+    # "never moved from its random initialization."
+    if history_far_frac is not None and any(not np.isnan(v) for v in history_far_frac):
+        fig, ax = plt.subplots(figsize=(9, 4), dpi=150)
+        eps_x = np.arange(1, len(history_far_frac) + 1)
+        ax.plot(eps_x, history_far_frac, 'o-', color='steelblue', lw=1.5, ms=3,
+                label='Trained policy: fraction of arrivals at shelter_far')
+        if len(history_far_frac) >= window:
+            valid = np.array([v if not np.isnan(v) else np.nan for v in history_far_frac])
+            if np.sum(~np.isnan(valid)) >= window:
+                ma = np.convolve(np.nan_to_num(valid, nan=np.nanmean(valid)),
+                                  np.ones(window) / window, mode='valid')
+                ax.plot(np.arange(window, len(history_far_frac) + 1), ma,
+                        '--', color='navy', lw=2, label=f'Trained policy: {window}-ep moving avg')
+        if baseline_far_frac is not None:
+            eps_bx = np.arange(1, len(baseline_far_frac) + 1)
+            ax.plot(eps_bx, baseline_far_frac, 'o-', color='seagreen', lw=1.2, ms=2, alpha=0.7,
+                    label='Shortest-path baseline: fraction of arrivals at shelter_far')
+        ax.axhline(0.5, color='gray', lw=1, ls=':', label='50/50 split')
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlabel('Episode'); ax.set_ylabel('Fraction of arrivals at shelter_far')
+        ax.set_title('Near/Far Shelter Choice per Episode')
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        plt.tight_layout(); plt.savefig('shelter_choice.png', dpi=150); plt.close()
+        print("  Shelter Choice Plot Saved: shelter_choice.png")
+
+    # ── Diagnostic: Critic/Actor loss + policy entropy per episode ───────────
+    # Lets you tell "Critic is converging (loss trending down/flat)" from
+    # "Critic is diverging/oscillating" -- if the Critic's value estimates
+    # are noisy or biased, the Actor's advantage-weighted updates inherit
+    # that noise, which can show up as a policy that drifts to a WORSE
+    # place over training instead of improving (see: reward/arrival-time
+    # getting worse over hundreds of episodes despite reward being the
+    # literal PPO objective -- a real red flag, not "expected" behavior).
+    # Entropy trending toward 0 too fast = policy locking in a choice
+    # before it's had enough exploration to find a good one.
+    if history_critic_loss is not None and any(not np.isnan(v) for v in history_critic_loss):
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(9, 7), dpi=150, sharex=True)
+        eps_x = np.arange(1, len(history_critic_loss) + 1)
+
+        ax1.plot(eps_x, history_critic_loss, 'o-', color='steelblue', lw=1, ms=2, alpha=0.5,
+                 label='Critic loss (MSE vs. GAE returns)')
+        if len(history_critic_loss) >= window:
+            valid = np.array([v if not np.isnan(v) else np.nan for v in history_critic_loss])
+            if np.sum(~np.isnan(valid)) >= window:
+                ma = np.convolve(np.nan_to_num(valid, nan=np.nanmean(valid)),
+                                  np.ones(window) / window, mode='valid')
+                ax1.plot(np.arange(window, len(history_critic_loss) + 1), ma,
+                          '--', color='navy', lw=2, label=f'{window}-ep moving avg')
+        ax1.set_ylabel('Critic loss'); ax1.set_yscale('log')
+        ax1.set_title('Critic loss per episode (log scale)')
+        ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
+
+        if history_actor_loss is not None:
+            ax2.plot(eps_x, history_actor_loss, 'o-', color='darkorange', lw=1, ms=2, alpha=0.5,
+                      label='Actor loss (clipped surrogate)')
+            if len(history_actor_loss) >= window:
+                valid_a = np.array([v if not np.isnan(v) else np.nan for v in history_actor_loss])
+                if np.sum(~np.isnan(valid_a)) >= window:
+                    ma_a = np.convolve(np.nan_to_num(valid_a, nan=np.nanmean(valid_a)),
+                                        np.ones(window) / window, mode='valid')
+                    ax2.plot(np.arange(window, len(history_actor_loss) + 1), ma_a,
+                              '--', color='firebrick', lw=2, label=f'{window}-ep moving avg (actor loss)')
+        if history_entropy is not None:
+            ax2b = ax2.twinx()
+            ax2b.plot(eps_x, history_entropy, 'o-', color='seagreen', lw=1, ms=2, alpha=0.4,
+                       label='Policy entropy')
+            ax2b.set_ylabel('Policy entropy (nats)', color='seagreen')
+        ax2.set_xlabel('Episode'); ax2.set_ylabel('Actor loss')
+        ax2.set_title('Actor loss + policy entropy per episode')
+        ax2.legend(fontsize=8, loc='upper left'); ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout(); plt.savefig('ppo_losses.png', dpi=150); plt.close()
+        print("  PPO Loss/Entropy Plot Saved: ppo_losses.png")
+
 if __name__ == '__main__':
     brain, res_arrival_arrived, res_arrival_timeout, res_arrival_counts, res_rewards, \
-        res_baseline_arrived, res_baseline_timeout, res_baseline_counts, res_baseline_rewards = train()
+        res_baseline_arrived, res_baseline_timeout, res_baseline_counts, res_baseline_rewards, \
+        res_history_far_frac, res_baseline_far_frac, \
+        res_history_critic_loss, res_history_actor_loss, res_history_entropy = train()
     plot_training_results(arrival_arrived_only=res_arrival_arrived,
                            arrival_with_timeout=res_arrival_timeout,
                            arrival_counts=res_arrival_counts,
@@ -602,4 +903,9 @@ if __name__ == '__main__':
                            baseline_arrived_only=res_baseline_arrived,
                            baseline_with_timeout=res_baseline_timeout,
                            baseline_counts=res_baseline_counts,
-                           baseline_rewards=res_baseline_rewards)
+                           baseline_rewards=res_baseline_rewards,
+                           history_far_frac=res_history_far_frac,
+                           baseline_far_frac=res_baseline_far_frac,
+                           history_critic_loss=res_history_critic_loss,
+                           history_actor_loss=res_history_actor_loss,
+                           history_entropy=res_history_entropy)

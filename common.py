@@ -18,7 +18,7 @@ BASE_SPEED   = 1.2    # pedestrian free-flow speed (m/s)
 ROAD_WIDTH   = 5.0    # effective road width (m); used to compute pedestrian density
 REWARD_DEST  = 1.0    # terminal reward given to an agent upon reaching a shelter
 GAMMA        = 0.99   # discount factor (higher = rewards propagate further back in time)
-TOTAL_EPISODES  = 500
+TOTAL_EPISODES  = 4000
 MAX_STEPS_EP    = 600  # max steps per episode; slightly generous to allow rerouting
 N_EXEC_AGENTS   = 3000
 N_TRAIN_AGENTS  = N_EXEC_AGENTS
@@ -286,6 +286,50 @@ def build_grid_graph(rows=5, cols=5, cell_size_m=80.0, connect_diagonals=True):
 
     road_nodes = set(node_coords.keys())
     return node_coords, adj, road_nodes
+
+
+def build_line_graph(dist_near=150.0, dist_far=300.0):
+    """
+    Build the simplest possible topology: a single 'center' node with one
+    edge extending to each side, to a 'shelter_near' node and a
+    'shelter_far' node (different distances, so a shortest-path policy
+    always sends everyone to shelter_near while a policy that accounts for
+    congestion has room to split traffic across both routes). No grid, no
+    branching -- just center---shelter_near and center---shelter_far.
+
+    node_coords places the three nodes on a line (center at the origin) so
+    existing (lat, lon)-style plotting code keeps working unchanged. Edge
+    weights in `adj` are real distances in meters.
+
+    Returns (node_coords, adj, road_nodes), matching parse_osm()'s /
+    build_grid_graph()'s signature.
+    """
+    node_coords = {
+        'center':       (0.0, 0.0),
+        'shelter_near': (0.0, dist_near / 111000.0),
+        'shelter_far':  (0.0, -dist_far / 111000.0),
+    }
+    adj = defaultdict(dict)
+    adj['center']['shelter_near'] = dist_near
+    adj['shelter_near']['center'] = dist_near
+    adj['center']['shelter_far']  = dist_far
+    adj['shelter_far']['center']  = dist_far
+
+    road_nodes = set(node_coords.keys())
+    return node_coords, adj, road_nodes
+
+
+def make_line_evac_data(capacity_per_shelter=10**6):
+    """
+    Fixed shelter assignment for build_line_graph(): both 'shelter_near' and
+    'shelter_far' are evacuation shelters, unlimited capacity by default
+    (evac_env.py doesn't enforce capacity anyway). Returns (evac_nodes,
+    evac_capacity), matching load_evac_data()'s / make_grid_evac_data()'s
+    signature.
+    """
+    evac_nodes = {'shelter_near', 'shelter_far'}
+    evac_capacity = {n: capacity_per_shelter for n in evac_nodes}
+    return evac_nodes, evac_capacity
 
 
 def make_grid_evac_data(road_nodes, n_shelters=2, capacity_per_shelter=10**6, seed=None):

@@ -153,7 +153,7 @@ STEP_TIME          = 5.0    # seconds per simulation step
 # (you can't out-walk the person in front of you). Replaces the old
 # multiplicative model (speed = basic_speed * ratio), which kept each
 # agent's relative speed advantage even at full jam density, unrealistically.
-SPEED_FREE_DENSITY = 0.5    # agents/m^2; at/below this, zero slowdown
+SPEED_FREE_DENSITY = 0.1    # agents/m^2; at/below this, zero slowdown
 DENSITY_MAX        = 1.0    # agents/m^2; jam density -- at/above this,
                              # speed = SPEED_MIN_ABS for every agent
 SPEED_MIN_ABS      = 0.01    # m/s; common floor speed at jam density,
@@ -186,6 +186,11 @@ def _piecewise_speed(basic_speed, density):
 STATUS_EVACUATING = np.int8(0)
 STATUS_SAFE       = np.int8(1)
 STATUS_FAILED     = np.int8(2)
+STATUS_WAITING    = np.int8(3)   # staggered_departure=True: hasn't left the
+                                  # start node yet (own randomly-assigned
+                                  # departure step hasn't arrived); excluded
+                                  # from movement, congestion, and rewards
+                                  # until it activates into STATUS_EVACUATING
 
 
 class EvacuationEnv(_Base):
@@ -200,8 +205,86 @@ class EvacuationEnv(_Base):
                  artificial_congestion_levels=(0.5, 0.8),
                  artificial_congestion_fraction=0.05,
                  artificial_congestion_target_shortest_path=False,
-                 artificial_congestion_sp_fraction=1.0):
+                 artificial_congestion_sp_fraction=1.0,
+                 staggered_departure=False,
+                 departure_window_frac=0.25,
+                 nearest_shelter_target=False,
+                 line_critic_state=True,
+                 edge_closure=None):
         """
+        edge_closure: optional dict describing a temporary road closure /
+            capacity reduction, active only during a step window:
+              {'edge': (node_a, node_b), 'start_step': int, 'end_step': int,
+               'density_floor': float}
+            While start_step <= current step < end_step, both directions of
+            the named edge get an artificial density FLOOR of
+            density_floor * DENSITY_MAX (e.g. 1.0 = full jam density, i.e.
+            effectively closed/crawling), on top of (whichever is higher
+            than) any artificial_congestion floor already in effect. Before
+            start_step and from end_step onward, the edge behaves normally
+            (no floor from this mechanism). Implemented as a single hook in
+            _eff_density(), so it automatically affects movement speed,
+            observations, reward's density-based terms, and the Critic's
+            global state consistently -- no other code path needs to know
+            about it. Silently disabled if 'edge' isn't a valid pair of
+            connected nodes. Off by default (None).
+
+            Use this to test whether a trained policy reacts to a sudden,
+            temporary perturbation (e.g. does it start routing newly-
+            departing agents around the closed edge, and does that behavior
+            relax back to normal after the closure lifts) -- see
+            test_edge_closure_adaptation.py.
+        line_critic_state: if True, get_global_state() returns a minimal
+            3-dim vector [density_near, density_far, frac_evacuating]
+            instead of the default 9-dim vector (6 edge features averaged
+            over ALL edges + hi80 + hi50 + frac_evacuating). The default
+            9-dim state was designed for graphs with many edges; on the
+            2-edge "line" topology (build_line_graph), averaging the two
+            edges' features together hides exactly the thing the Critic
+            most needs to know -- whether it's the near or the far edge
+            that's congested -- and most of the other 5 averaged features
+            turn out to be redundant or constant for this topology (own
+            basic_speed is population-wide, not edge-specific; area never
+            changes; speed_ratio and density_ratio are just deterministic
+            functions of density). hi80/hi50 are also dropped here since
+            density rarely reaches 50-80% of DENSITY_MAX under a low
+            SPEED_FREE_DENSITY setting, making those flags mostly dead.
+            Requires a 'center' node with exactly the two shelter edges
+            coming out of it (as build_line_graph produces); silently
+            falls back to the default 9-dim behavior otherwise, so it's
+            safe to leave True by accident on a non-line topology. Off by
+            default -- grid/real-map behavior is completely unchanged.
+        nearest_shelter_target: if True, reset() assigns each agent's
+            initial destination shelter as whichever shelter is CLOSEST to
+            its start node (deterministic), instead of a uniformly random
+            shelter. Combined with cluster_start putting everyone at the
+            same start node, this makes the shortest-path baseline send
+            100% of agents to the single nearest shelter (e.g. Dijkstra
+            piling everyone onto one route). An agent can still end up at
+            a DIFFERENT shelter than this initial assignment: whenever it
+            commits to a new edge at a decision node (see step()'s Phase 1)
+            and that edge leads directly to a shelter, its destination is
+            updated to that shelter -- i.e. choosing to walk toward a
+            shelter now counts as re-targeting yourself there, so a
+            trained policy can learn to send some agents to a farther-but-
+            less-congested shelter instead of all following the same
+            nearest-shelter path. Off by default (original uniformly
+            random, fixed-for-the-whole-episode target assignment).
+        staggered_departure: if True, each agent gets its own random
+            departure step (uniformly sampled from [0, departure_window_frac
+            * max_steps]) instead of all agents starting to evacuate at
+            step 0. Before its departure step, an agent sits at its start
+            node in a separate STATUS_WAITING state: it isn't given actions,
+            doesn't contribute to link congestion, and doesn't earn/lose
+            reward. It becomes STATUS_EVACUATING (and starts accumulating
+            travel time / reward) exactly on its own departure step. Models
+            people leaving at different times rather than everyone reacting
+            instantly. Off by default (everyone departs at step 0).
+        departure_window_frac: fraction of max_steps over which departure
+            steps are spread (uniformly), e.g. 0.25 = everyone has departed
+            by 25% of the way through the episode, then it plays out as a
+            normal evacuation from there. Only used when
+            staggered_departure=True.
         cluster_start: if True, reset() picks one random node each episode as
             a "cluster center" and samples every agent's start position from
             nodes within `cluster_radius_hops` hops of it, instead of
@@ -268,7 +351,29 @@ class EvacuationEnv(_Base):
         self.artificial_congestion_fraction = artificial_congestion_fraction
         self.artificial_congestion_target_shortest_path = artificial_congestion_target_shortest_path
         self.artificial_congestion_sp_fraction           = artificial_congestion_sp_fraction
+        self.staggered_departure   = staggered_departure
+        self.departure_window_frac = departure_window_frac
+        self.nearest_shelter_target = nearest_shelter_target
+        # line_critic_state only actually applies if there's a 'center' node
+        # with edges coming out of it (see get_global_state()) -- otherwise
+        # it silently falls back to the default 9-dim state, so decide
+        # global_state_dim the same way here up front, rather than 3 always.
+        self.line_critic_state = line_critic_state and ('center' in node_to_idx)
+        self.global_state_dim  = 3 if self.line_critic_state else 9
         self._congestion_floor = {}   # (cidx, nidx) -> density floor; populated in reset()
+
+        # Temporary road closure (see edge_closure docstring above). Resolve
+        # the node-name edge to a directed-index pair once, up front;
+        # silently disabled (None) if the nodes aren't both known/connected.
+        self.edge_closure    = None
+        self._closure_a_idx  = None
+        self._closure_b_idx  = None
+        if edge_closure is not None:
+            a, b = edge_closure['edge']
+            if a in node_to_idx and b in node_to_idx:
+                self.edge_closure   = edge_closure
+                self._closure_a_idx = node_to_idx[a]
+                self._closure_b_idx = node_to_idx[b]
         self._non_shelter   = [n for n in node_list if n not in evac_nodes]
 
         # ── Precomputed road lengths (src_idx, dst_idx) -> metres, and edge areas ──
@@ -296,6 +401,12 @@ class EvacuationEnv(_Base):
         self._n_shelters       = max(len(self._shelter_list), 1)
         self._shelter_node_idx = np.array(
             [node_to_idx[s] for s in self._shelter_list], dtype=np.int32)
+        # Reverse lookup (node_idx -> shelter slot), used by step()'s Phase 1
+        # when nearest_shelter_target=True to re-target an agent that just
+        # committed to an edge leading directly to a (possibly different)
+        # shelter.
+        self._shelter_slot_of_node = {
+            int(n): s for s, n in enumerate(self._shelter_node_idx)}
         self._shelter_dist = np.full((self._n_shelters, self.n_nodes), 1e9, dtype=np.float32)
         self._shelter_hops = np.full((self._n_shelters, self.n_nodes), 10**6, dtype=np.int32)
         self._shelter_neighbor_order = []
@@ -339,9 +450,19 @@ class EvacuationEnv(_Base):
         self._agent_speed          = np.full(n_agents, AGENT_SPEED_MEAN, dtype=np.float32)
         self._agent_init_hops      = np.ones(n_agents, dtype=np.float32)
         self._agent_travel_steps   = np.zeros(n_agents, dtype=np.int32)
+        self._agent_depart_step    = np.zeros(n_agents, dtype=np.int32)
         self._step_count           = 0
         self._rng                  = np.random.default_rng(42)
         self._arrival_times        = []
+        self._arrival_times_abs    = []   # time since episode start (includes
+                                           # any staggered-departure wait), vs.
+                                           # _arrival_times which is travel time
+                                           # only -- see staggered_departure
+        self._arrival_shelter      = []   # shelter slot index each arrival
+                                           # ended up at (diagnostic only --
+                                           # e.g. lets training.py track what
+                                           # fraction of agents choose the
+                                           # far vs. near shelter, over time)
 
         self._current_link_use = {}
         self._actions_arr      = np.zeros(n_agents, dtype=np.int32)
@@ -450,9 +571,22 @@ class EvacuationEnv(_Base):
     def _eff_density(self, cidx, nidx, cnt, area):
         """Effective density on edge (cidx,nidx): the real agent-count-based
         density, floored at this edge's artificial congestion level (0.0 if
-        artificial_congestion is off or this edge wasn't selected)."""
+        artificial_congestion is off or this edge wasn't selected), further
+        floored at edge_closure's density_floor while a temporary closure on
+        this edge is active (see edge_closure docstring in __init__). This
+        single hook is used by movement/speed, observations, reward's
+        density terms, and the Critic's global state, so a closure
+        automatically shows up consistently everywhere without any other
+        code path needing to know about it."""
         d = cnt / area
         floor = self._congestion_floor.get((cidx, nidx), 0.0)
+        if (self.edge_closure is not None
+                and (cidx, nidx) in ((self._closure_a_idx, self._closure_b_idx),
+                                      (self._closure_b_idx, self._closure_a_idx))
+                and self.edge_closure['start_step'] <= self._step_count < self.edge_closure['end_step']):
+            closure_floor = self.edge_closure['density_floor'] * DENSITY_MAX
+            if closure_floor > floor:
+                floor = closure_floor
         return d if d > floor else floor
 
     def reset(self, seed=None, options=None):
@@ -467,6 +601,21 @@ class EvacuationEnv(_Base):
         self._actions_arr[:]          = 0
         self._agent_travel_steps[:]   = 0
         self._arrival_times           = []
+        self._arrival_times_abs       = []
+        self._arrival_shelter         = []
+
+        if self.staggered_departure:
+            # Each agent gets its own random departure step, uniformly over
+            # [0, departure_window_frac * max_steps]. Agents with a non-zero
+            # departure step start in STATUS_WAITING and are activated into
+            # STATUS_EVACUATING by step() once _step_count reaches their
+            # departure step (see top of step()).
+            max_depart = max(1, int(round(self.departure_window_frac * self.max_steps)))
+            self._agent_depart_step[:] = self._rng.integers(0, max_depart + 1, size=self.n_agents)
+            self._agent_status[:] = STATUS_WAITING
+            self._agent_status[self._agent_depart_step == 0] = STATUS_EVACUATING
+        else:
+            self._agent_depart_step[:] = 0
 
         if self.cluster_start:
             # Pick one random cluster center (from cluster_center_pool if
@@ -498,8 +647,18 @@ class EvacuationEnv(_Base):
         for i in range(self.n_agents):
             self._agent_node_idx[i] = self.node_to_idx[candidates[start_idxs[i]]]
 
-        # Random destination shelter per agent (capacity NOT considered).
-        target_slots = self._rng.integers(0, self._n_shelters, size=self.n_agents)
+        if self.nearest_shelter_target:
+            # Deterministic: everyone's initial target is whichever shelter
+            # is closest to their own start node (see nearest_shelter_target
+            # docstring in __init__ -- this is what makes the shortest-path
+            # baseline pile everyone onto a single nearest-shelter route).
+            # Agents can still end up re-targeted to a different shelter
+            # later, in step()'s Phase 1, if they choose to walk toward one.
+            target_slots = np.argmin(
+                self._shelter_dist[:, self._agent_node_idx], axis=0)
+        else:
+            # Random destination shelter per agent (capacity NOT considered).
+            target_slots = self._rng.integers(0, self._n_shelters, size=self.n_agents)
         self._agent_target_shelter[:] = target_slots
 
         # Random per-agent basic walking speed for this episode.
@@ -533,22 +692,56 @@ class EvacuationEnv(_Base):
         infos        = {}
         link_use     = defaultdict(int)
 
+        # ── Phase 0: Activate any agents whose departure step has arrived ──────
+        # Newly-activated agents are NOT moved onto a link this same tick (see
+        # Phase 1 below) -- they sit at their start node for exactly one step
+        # so active_mask correctly reports them as needing a decision. The
+        # training loop then gets a chance to run the actual Actor on their
+        # observation (which reflects THIS tick's congestion) before they
+        # pick an edge, instead of silently moving on a stale/default action
+        # before the Actor ever saw them.
+        just_activated = np.zeros(self.n_agents, dtype=bool)
+        if self.staggered_departure:
+            depart_now = np.where((self._agent_status == STATUS_WAITING) &
+                                   (self._agent_depart_step <= self._step_count))[0]
+            if len(depart_now):
+                self._agent_status[depart_now] = STATUS_EVACUATING
+                just_activated[depart_now] = True
+
         # ── Phase 1: Move ─────────────────────────────────────────────────────
         evac_idxs = np.where(self._agent_status == STATUS_EVACUATING)[0]
         self._agent_travel_steps[evac_idxs] += 1
 
         for i in evac_idxs:
+            if just_activated[i]:
+                # Just left STATUS_WAITING this tick -- stay put at the start
+                # node so active_mask picks them up next step for a real
+                # Actor decision (see Phase 0 comment above).
+                continue
             target = int(self._agent_target_shelter[i])
             if not self._agent_on_link[i]:
                 cidx = int(self._agent_node_idx[i])
                 nb   = self._shelter_neighbor_order[target][cidx]
                 if not nb:
                     continue
-                act  = min(int(actions_arr[i]), len(nb) - 1)
+                act    = min(int(actions_arr[i]), len(nb) - 1)
+                nb_idx = nb[act]
                 self._agent_link_src[i]      = cidx
-                self._agent_link_dst[i]      = nb[act]
+                self._agent_link_dst[i]      = nb_idx
                 self._agent_on_link[i]       = True
                 self._agent_link_progress[i] = 0.0
+
+                if self.nearest_shelter_target:
+                    # Re-target: choosing to walk down an edge that leads
+                    # directly to a shelter counts as picking that shelter
+                    # as your new destination, even if it differs from the
+                    # one assigned at reset() (see nearest_shelter_target
+                    # docstring). No-op if nb_idx isn't a shelter node, or
+                    # is the same shelter already targeted.
+                    new_slot = self._shelter_slot_of_node.get(nb_idx)
+                    if new_slot is not None and new_slot != target:
+                        self._agent_target_shelter[i] = new_slot
+                        target = new_slot
 
             cidx = int(self._agent_link_src[i])
             nidx = int(self._agent_link_dst[i])
@@ -591,17 +784,21 @@ class EvacuationEnv(_Base):
             density_ratio = density / DENSITY_MAX
             congestion_excess = max(0.0, (density_ratio - CONGESTION_THRESHOLD) / (1.0 - CONGESTION_THRESHOLD))
             r_congestion = -CONGESTION_PENALTY * min(congestion_excess, 1.0)
-            r_time       = -TIME_PENALTY
+            r_congestion = 0.0
+            r_shape      = 0.0
+            r_time       = -10.0 * TIME_PENALTY
 
             target_node_idx = int(self._shelter_node_idx[target])
             if not self._agent_on_link[i] and nidx == target_node_idx:
                 # Destination reached. Capacity is not enforced (destinations
                 # were assigned ignoring capacity), so arrival always succeeds.
                 self._agent_status[i] = STATUS_SAFE
-                rewards[a]      = 10.0 + r_shape + r_congestion + r_time
+                rewards[a]      = 0.0 + r_shape + r_congestion + r_time
                 terminations[a] = True
                 truncations[a]  = False
                 self._arrival_times.append(int(self._agent_travel_steps[i]) * STEP_TIME)
+                self._arrival_times_abs.append(self._step_count * STEP_TIME)
+                self._arrival_shelter.append(target)
             elif self._step_count >= self.max_steps:
                 self._agent_status[i] = STATUS_FAILED
                 rewards[a]      = r_shape + r_congestion + r_time
@@ -692,15 +889,43 @@ class EvacuationEnv(_Base):
     # ── Global state ──────────────────────────────────────────────────────────
     def get_global_state(self, n_evac, link_use):
         """
-        Compute the 9-dim global state vector used by the Critic:
-          [0:6] the 6 edge features (area, basic_speed, n_agents, density,
-                avg_speed_ratio, density_ratio), each averaged over every
-                edge in the graph. Feature 1 becomes the population's mean
-                basic_speed (since there is no single "current agent" here).
+        Compute the global state vector used by the Critic. Two modes:
+
+        line_critic_state=True (dim=3): [density_near, density_far,
+            frac_evacuating] -- the two edges out of 'center' are looked
+            up directly (sorted by length, so index 0 is always the
+            shorter/near edge regardless of internal ordering) and their
+            *un-averaged* densities are reported separately. See
+            line_critic_state's docstring in __init__ for why the other
+            raw edge features are dropped as redundant/constant for this
+            2-edge topology.
+
+        line_critic_state=False (dim=9, default): [0:6] the 6 edge
+            features (area, basic_speed, n_agents, density,
+            avg_speed_ratio, density_ratio), each averaged over every
+            edge in the graph. Feature 1 becomes the population's mean
+            basic_speed (since there is no single "current agent" here).
           [6]   fraction of edges with density > 80% of DENSITY_MAX
           [7]   fraction of edges with density > 50% of DENSITY_MAX
           [8]   fraction of agents still evacuating (traveling)
         """
+        if self.line_critic_state:
+            frac_evac = n_evac / self.n_agents if self.n_agents else 0.0
+            center_idx = self.node_to_idx.get('center')
+            out_edges = sorted(
+                ((nidx, length) for (cidx, nidx), length in self.road_lengths.items()
+                 if cidx == center_idx),
+                key=lambda t: t[1])
+            densities = []
+            for nidx, _ in out_edges[:2]:
+                area = self.edge_area.get((center_idx, nidx), ROAD_WIDTH)
+                cnt  = link_use.get((center_idx, nidx), 0)
+                density = self._eff_density(center_idx, nidx, cnt, area)
+                densities.append(min(density / DENSITY_MAX, 1.0))
+            while len(densities) < 2:
+                densities.append(0.0)
+            return np.array([densities[0], densities[1], frac_evac], dtype=np.float32)
+
         if not self.road_lengths:
             edge_feat_avg = np.zeros(6, dtype=np.float32)
             hi80 = hi50 = 0
@@ -742,11 +967,33 @@ class EvacuationEnv(_Base):
         n_safe = int(np.sum(self._agent_status == STATUS_SAFE))
         n_fail = int(np.sum(self._agent_status == STATUS_FAILED))
         n_evac = int(np.sum(self._agent_status == STATUS_EVACUATING))
+        n_wait = int(np.sum(self._agent_status == STATUS_WAITING))
         arrived = list(self._arrival_times)
         avg_arrival_arrived_only = float(np.mean(arrived)) if arrived else float('nan')
         all_times = arrived + [self.max_steps * STEP_TIME] * (self.n_agents - len(arrived))
         avg_arrival_with_timeout = float(np.mean(all_times)) if all_times else float('nan')
-        return dict(safe=n_safe, failed=n_fail, evacuating=n_evac,
+        # "_abs" variants measure time since episode start (i.e. including any
+        # staggered-departure wait), vs. the above which is travel time only
+        # (time since each agent's own departure). Identical to the above
+        # when staggered_departure=False, since every agent departs at step 0.
+        arrived_abs = list(self._arrival_times_abs)
+        avg_arrival_arrived_only_abs = float(np.mean(arrived_abs)) if arrived_abs else float('nan')
+        all_times_abs = arrived_abs + [self.max_steps * STEP_TIME] * (self.n_agents - len(arrived_abs))
+        avg_arrival_with_timeout_abs = float(np.mean(all_times_abs)) if all_times_abs else float('nan')
+        # Diagnostic only: how many arrivals ended up at each shelter slot
+        # (index matches self._shelter_list). Lets callers track e.g. what
+        # fraction of agents chose the far vs. near shelter, and whether
+        # that fraction actually changes over training (vs. staying fixed
+        # at whatever an untrained policy's initial action distribution
+        # happens to produce).
+        arrival_shelter_counts = np.bincount(
+            np.array(self._arrival_shelter, dtype=np.int64),
+            minlength=self._n_shelters).tolist() if self._arrival_shelter else [0] * self._n_shelters
+        return dict(safe=n_safe, failed=n_fail, evacuating=n_evac, waiting=n_wait,
                     n_arrived=len(arrived), n_agents=self.n_agents,
                     avg_arrival_time_arrived_only=avg_arrival_arrived_only,
-                    avg_arrival_time_with_timeout=avg_arrival_with_timeout)
+                    avg_arrival_time_with_timeout=avg_arrival_with_timeout,
+                    avg_arrival_time_arrived_only_abs=avg_arrival_arrived_only_abs,
+                    avg_arrival_time_with_timeout_abs=avg_arrival_with_timeout_abs,
+                    arrival_shelter_counts=arrival_shelter_counts,
+                    shelter_list=list(self._shelter_list))
