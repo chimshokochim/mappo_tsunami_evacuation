@@ -4,7 +4,7 @@ Defines constants, graph utilities, and helper functions used across all scripts
 """
 
 import xml.etree.ElementTree as ET
-import math, random, heapq, time
+import math, random, heapq, time, os
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -26,7 +26,12 @@ DT              = 5.0     # simulation timestep (seconds)
 MAX_TIME        = 3600    # max simulation time (seconds = 1 hour)
 ACTOR_PATH      = 'actor.npy'          # saved actor weights for execution
 GRAPH_PATH      = 'graph_data.pkl'     # cached graph so OSM re-parsing can be skipped
-SEED = 42
+# Overridable via the MAPPO_TRAIN_SEED environment variable so a runner
+# script (see run_multiseed.py) can launch several independent training
+# runs -- each getting its own network initialization AND its own
+# per-episode start/target/speed randomness -- without editing this file
+# between runs. Defaults to 42, unchanged, when the env var isn't set.
+SEED = int(os.environ.get('MAPPO_TRAIN_SEED', 42))
 
 
 def haversine(c1, c2):

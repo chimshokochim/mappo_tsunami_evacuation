@@ -470,7 +470,12 @@ def train():
         train_nearest_shelter_target = LINE_NEAREST_SHELTER_TARGET
         train_line_critic_state      = LINE_CRITIC_STATE
         graph_save_path       = 'graph_data_line.pkl'
-        model_prefix          = 'mappo_line'
+        # MAPPO_RUN_TAG lets a multi-seed runner (see run_multiseed.py) give
+        # each run's actor/critic/history files a distinct name (e.g.
+        # 'mappo_line_seed43_...') so parallel runs with different SEEDs
+        # don't overwrite each other's output. Empty by default -- normal
+        # single-run behavior (file names) is unchanged.
+        model_prefix          = 'mappo_line' + os.environ.get('MAPPO_RUN_TAG', '')
     elif USE_GRID_MAP:
         print(f"Using synthetic {GRID_ROWS}x{GRID_COLS} grid map "
               f"({'8' if GRID_CONNECT_DIAGONALS else '4'}-connected) instead of the OSM map.")

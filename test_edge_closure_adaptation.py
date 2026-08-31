@@ -57,6 +57,20 @@ back within RECOVERY_THRESHOLD_FRAC (relative) of the WITHOUT-closure
 trajectory AT THE SAME STEP. This isolates the closure's actual effect
 from ordinary departure-driven congestion growth.
 
+CLOSURE TIMING -- moved per Bhaskar's feedback on the first version: with
+the closure at steps 50-100, by the time it started roughly 22% of agents
+had already departed and committed to an edge (staggered departure spreads
+departures over steps 0-225), and by the time it ended only ~44% had
+departed -- so most agents' actual near/far decision fell either before or
+long after the closure, and the aggregate P(far) barely moved even if the
+policy was responding correctly to the (few) decisions that did fall inside
+the window. Now the closure starts at step 0 (nobody has departed yet) and
+stays active through step 225 (the end of the departure window), so
+essentially every agent's initial near/far decision happens while the
+closure is in effect -- maximizing the number of decisions that can
+actually show a reaction, per Bhaskar's suggestion to move the closure
+earlier / align it with a longer span of departures.
+
 Runs the SAME closure scenario under two policies for direct comparison:
   - MAPPO: the trained Actor (mappo_line_actor.pt), which CAN divert
     newly-deciding agents to the far edge during the closure.
@@ -98,15 +112,26 @@ DEPARTURE_WINDOW_FRAC    = 0.25   # everyone has departed by step 225
 NEAREST_SHELTER_TARGET   = True
 
 # ── Closure config ──────────────────────────────────────────────────────────────
-# Placed INSIDE the departure window (0-225) so agents are still arriving at
-# 'center' and making fresh decisions both during and after the closure --
-# otherwise there'd be nobody left to show behavioral adaptation. Closes the
-# 'near' edge specifically, since that's the dominant/majority route under
-# NEAREST_SHELTER_TARGET (everyone's default target is shelter_near).
+# Timed to a 20% / 60% / 20% split of departures relative to the closure
+# window: departure steps are sampled uniformly from [0, DEPARTURE_WINDOW]
+# (DEPARTURE_WINDOW = DEPARTURE_WINDOW_FRAC * MAX_STEPS = 225 here; see
+# evac_env.py's reset(), self._agent_depart_step), so putting the closure
+# boundaries at the 20th and 80th percentile of that range means ~20% of
+# agents have already departed before the closure starts, ~60% depart while
+# it's active, and the remaining ~20% depart only after it's lifted --
+# giving a "before / during / after" population split for comparison,
+# rather than (as in the two earlier versions of this script) either too
+# few agents overlapping the closure (50-100) or essentially the entire
+# population overlapping it (0-225, no "before"/"after" group left to
+# compare against). Closes the 'near' edge specifically, since that's the
+# dominant/majority route under NEAREST_SHELTER_TARGET (everyone's default
+# target is shelter_near).
 CLOSURE_EDGE         = ('center', 'shelter_near')
-CLOSURE_START_STEP   = 50
-CLOSURE_END_STEP     = 100
-CLOSURE_DENSITY_FLOOR = 0.9   # fraction of DENSITY_MAX -- near-total gridlock
+DEPARTURE_WINDOW     = DEPARTURE_WINDOW_FRAC * MAX_STEPS   # == 225
+CLOSURE_START_STEP   = round(0.20 * DEPARTURE_WINDOW)      # == 45
+CLOSURE_END_STEP     = round(0.80 * DEPARTURE_WINDOW)      # == 180
+CLOSURE_DENSITY_FLOOR = 0.9   # fraction of DENSITY_MAX -- ~88% speed drop
+                               # (near-total gridlock, see prior discussion)
 
 # "Recovered" = with-closure value is within this relative fraction of the
 # same-step no-closure (counterfactual) value, e.g. 0.95 means the two
@@ -283,6 +308,10 @@ def summarize(label, with_density_list, with_decisions_list,
         return (far_frac_in_window(with_decisions, lo, hi),
                 far_frac_in_window(without_decisions, lo, hi))
 
+    # Closure boundaries are set at the 20th/80th percentile of the
+    # departure distribution (see CLOSURE_START_STEP/END_STEP above), so
+    # there's a real ~20% "before" group and ~20% "after" group again to
+    # compare against the ~60% "during" group.
     before_w, before_wo = far_pair(0, CLOSURE_START_STEP)
     during_w, during_wo = far_pair(CLOSURE_START_STEP, CLOSURE_END_STEP)
     after_w, after_wo   = far_pair(CLOSURE_END_STEP, CLOSURE_END_STEP + 50)
@@ -290,8 +319,9 @@ def summarize(label, with_density_list, with_decisions_list,
 
     print(f'\n--- {label} ---')
     print(f'P(choose far), with-closure vs. no-closure counterfactual:')
-    print(f'  before closure:            {before_w:.3f} vs {before_wo:.3f}')
-    print(f'  during closure:            {during_w:.3f} vs {during_wo:.3f}  '
+    print(f'  before closure (~20% of departures): {before_w:.3f} vs {before_wo:.3f}  '
+          f'(excess = {before_w - before_wo:+.3f})')
+    print(f'  during closure (~60% of departures): {during_w:.3f} vs {during_wo:.3f}  '
           f'(excess = {during_w - during_wo:+.3f})')
     print(f'  50 steps after closure ends: {after_w:.3f} vs {after_wo:.3f}  '
           f'(excess = {after_w - after_wo:+.3f})')
@@ -356,34 +386,42 @@ def main():
     base_stats  = summarize('Shortest-path baseline (always near)',
                              base_with_d, base_with_dec, base_without_d, base_without_dec)
 
-    # ── Plot 1: density_near timeline -- with-closure vs. no-closure counterfactual ──
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8), dpi=150, sharex=True)
-    for ax, stats, title in [(axes[0, 0], mappo_stats, 'MAPPO'),
-                              (axes[0, 1], base_stats, 'Shortest-path baseline')]:
-        ax.axvspan(CLOSURE_START_STEP, CLOSURE_END_STEP, color='red', alpha=0.12,
+    # ── Plot: density_near AND P(far) together on the same time axis, per ────
+    # policy -- per Bhaskar's suggestion to "plot P(far) against time
+    # alongside near-edge density" so the reaction (or lack of it) is
+    # directly visible against the congestion that's supposedly driving it,
+    # rather than split across separate subplots.
+    fig, (ax_m, ax_b) = plt.subplots(2, 1, figsize=(10, 9), dpi=150, sharex=True)
+    for ax, stats, with_dec, without_dec, title in [
+            (ax_m, mappo_stats, mappo_with_dec, mappo_without_dec, 'MAPPO'),
+            (ax_b, base_stats, base_with_dec, base_without_dec, 'Shortest-path baseline')]:
+        ax.axvspan(CLOSURE_START_STEP, CLOSURE_END_STEP, color='red', alpha=0.10,
                    label='Closure active')
-        ax.plot(stats['with_density'], color='firebrick', lw=1.5, label='With closure')
-        ax.plot(stats['without_density'], color='gray', lw=1.5, ls='--',
-                label='No closure (counterfactual)')
-        rt = stats['rt_density']
-        ax.set_title(f'{title} -- density_near')
-        ax.set_ylabel('density_near'); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-        ax.set_ylim(0, 4)   # shared scale across both panels for direct comparison
+        l1, = ax.plot(stats['with_density'], color='firebrick', lw=1.5,
+                       label='density_near, with closure')
+        l2, = ax.plot(stats['without_density'], color='firebrick', lw=1.2, ls=':',
+                       label='density_near, no closure (counterfactual)')
+        ax.set_ylabel('density_near', color='firebrick')
+        ax.set_ylim(0, 4)
+        ax.tick_params(axis='y', labelcolor='firebrick')
 
-    # ── Plot 2: behavioral P(far), binned, with vs. without closure ──────────────
-    for ax, with_dec, without_dec, title in [
-            (axes[1, 0], mappo_with_dec, mappo_without_dec, 'MAPPO'),
-            (axes[1, 1], base_with_dec, base_without_dec, 'Shortest-path baseline')]:
+        ax2 = ax.twinx()
         wx, wy = binned_far_frac(with_dec)
         nx, ny = binned_far_frac(without_dec)
-        ax.axvspan(CLOSURE_START_STEP, CLOSURE_END_STEP, color='red', alpha=0.12)
-        ax.plot(wx, wy, 'o-', color='firebrick', lw=1.5, ms=4, label='With closure')
-        ax.plot(nx, ny, 'o-', color='gray', lw=1.5, ms=4, ls='--',
-                label='No closure (counterfactual)')
-        ax.set_title(f'{title} -- P(choose far)')
-        ax.set_xlabel('Simulation step'); ax.set_ylabel('P(choose far)')
-        ax.set_ylim(-0.05, 1.05); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        l3, = ax2.plot(wx, wy, 'o-', color='steelblue', lw=1.5, ms=4,
+                        label='P(choose far), with closure')
+        l4, = ax2.plot(nx, ny, 'o-', color='steelblue', lw=1.2, ms=3, ls=':',
+                        label='P(choose far), no closure (counterfactual)')
+        ax2.set_ylabel('P(choose far)', color='steelblue')
+        ax2.set_ylim(-0.05, 1.05)
+        ax2.tick_params(axis='y', labelcolor='steelblue')
 
+        rt = stats['rt_density']
+        ax.set_title(f'{title}')
+        ax.legend(handles=[l1, l2, l3, l4], fontsize=7, loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+    ax_b.set_xlabel('Simulation step')
     plt.tight_layout(); plt.savefig(OUTPUT_PNG, dpi=150); plt.close()
     print(f'\nSaved: {OUTPUT_PNG}')
 
