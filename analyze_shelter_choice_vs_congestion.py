@@ -42,7 +42,7 @@ from common import (SEED, build_line_graph, make_line_evac_data,
 from evac_env import EvacuationEnv
 
 # ── Config (mirrors training.py's USE_LINE_MAP block) ──────────────────────────
-ACTOR_PATH   = 'mappo_line_actor.pt'
+ACTOR_PATH   = 'mappo_line_seed44_rollout4_16000ep_actor.pt'
 HIDDEN_SIZE  = 64
 
 LINE_DIST_NEAR         = 150.0
@@ -56,7 +56,7 @@ NEAREST_SHELTER_TARGET   = True
 N_EPISODES = 10   # more episodes = more decision points = smoother scatter/correlation
 BASE_SEED  = SEED
 
-OUTPUT_PNG = 'shelter_choice_vs_congestion.png'
+OUTPUT_PNG = 'shelter_choice_vs_congestion_rollout4_16000ep_baseline.png'
 
 
 class Actor(nn.Module):
@@ -142,6 +142,26 @@ def main():
     print(f'Pearson correlation (density_near - density_far) vs p_far: {corr:.3f}')
     print('(positive = policy raises P(far) when near gets more congested than far -- '
           'i.e. congestion-aware behavior. Near zero = policy ignores congestion state.)')
+
+    # ── Does the STATE itself carry enough variation to condition on? ──────────
+    # Checks whether density_near/density_far/density_diff actually vary
+    # meaningfully across decisions, independent of whether the policy is
+    # using that variation. If these are nearly constant at decision time
+    # (e.g. because congestion hasn't built up yet when agents leave 'center'),
+    # no amount of reward shaping can make the policy condition on them --
+    # there'd be nothing informative to condition on.
+    def _stats(name, arr):
+        print(f'  {name:12s}: mean={arr.mean():.4f}  std={arr.std():.4f}  '
+              f'min={arr.min():.4f}  p25={np.percentile(arr,25):.4f}  '
+              f'median={np.median(arr):.4f}  p75={np.percentile(arr,75):.4f}  '
+              f'max={arr.max():.4f}')
+    print('\nState variation at decision time (raw obs_mat density features, in [0,1]):')
+    _stats('density_near', density_near)
+    _stats('density_far',  density_far)
+    _stats('density_diff', density_diff)
+    print('(if std is tiny relative to the range these features could take (0-1), '
+          'the state barely varies across decisions -- reward shaping alone would '
+          'have little to condition on.)')
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     ax.scatter(density_diff, p_far, s=8, alpha=0.15, color='steelblue')

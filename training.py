@@ -33,12 +33,80 @@ print(f"Using device: {device}")
 
 # ── Hyperparameters ────────────────────────────────────────────────────────────
 HIDDEN_SIZE    = 64     # neurons per hidden layer (both Actor and Critic)
-LR_ACTOR       = 3e-4  # Adam learning rate for Actor
+LR_ACTOR       = 1e-4  # Adam learning rate for Actor -- orthogonal init removed
+                        # (accelerated instability instead of taming it, see note
+                        # near Actor/Critic classes), so back to LR=1e-4 + rollout=4
+                        # + entropy anneal(ep9000) as the best-confirmed combo so far.
+# LR_ACTOR       = 3e-4  # original
+# LR_ACTOR       = 3e-5  # screening-test value, no longer needed w/o orthoinit
 LR_CRITIC      = 1e-3  # Adam learning rate for Critic (higher: faster value learning)
 GAE_LAMBDA     = 0.95  # GAE smoothing factor (0=TD, 1=MC)
 CLIP_EPSILON   = 0.2   # PPO clipping range for policy ratio
 UPDATE_EPOCHS  = 4     # number of gradient passes per rollout buffer
-ENTROPY_COEF   = 0.05  # weight on entropy bonus (encourages exploration)
+ENTROPY_COEF   = 0.05  # starting weight on entropy bonus (encourages exploration)
+
+# ── Entropy coefficient annealing ───────────────────────────────────────
+# Diagnosed via plot_actor_loss_decomposition.py: once policy entropy
+# saturates near its ceiling (ln(2) for a 2-action policy) mid-training,
+# the PPO surrogate term (the actual advantage-driven improvement signal)
+# shrinks toward ~0, so the FIXED entropy bonus (ENTROPY_COEF * H) comes to
+# dominate the total actor_loss almost entirely -- the network keeps being
+# pushed toward max-entropy (near-uniform) behavior long after the
+# advantage signal that justified high entropy has died down, which we
+# believe drives the slow, unexplained far_frac drift back into the
+# congestion-danger zone seen late in training.
+#
+# Fix: keep ENTROPY_COEF_START = ENTROPY_COEF unchanged (this preserves
+# the early-training exploration that let the good far_frac trajectory
+# emerge in the first place -- do not touch the starting value, only the
+# decay), and linearly anneal it down to ENTROPY_COEF_END by a fixed
+# ABSOLUTE episode (ENTROPY_ANNEAL_EPISODE), then hold flat at
+# ENTROPY_COEF_END for the remainder.
+#
+# NOTE: originally this was expressed as a FRACTION of TOTAL_EPISODES
+# (e.g. anneal over the first 60%), reasoning that this would scale
+# correctly for short test runs. That was wrong: across every run so far
+# (LR=3e-4 and LR=1e-5 alike), the far_frac self-correction from its
+# mid-training overshoot (~0.58) back down to the true optimum (~0.4) has
+# consistently happened around ep8000-9000 in ABSOLUTE episode terms,
+# seemingly independent of TOTAL_EPISODES or LR -- likely tied to how long
+# the Critic itself takes to catch up, not to the Actor's LR. A
+# fraction-based schedule on a short TOTAL_EPISODES run (e.g. 4000) then
+# anneals to completion at ep2400, well before that ep8000-9000
+# self-correction point, locking the policy into the bad overshoot state.
+# Using a fixed absolute anchor avoids this mismatch regardless of how
+# long the run is.
+ENTROPY_COEF_START   = ENTROPY_COEF
+ENTROPY_COEF_END     = 0.01
+ENTROPY_ANNEAL_EPISODE = 9000   # absolute episode by which to reach ENTROPY_COEF_END
+
+
+def current_entropy_coef(ep):
+    """Linear anneal from ENTROPY_COEF_START to ENTROPY_COEF_END by absolute
+    episode ENTROPY_ANNEAL_EPISODE, then hold at the end value."""
+    if ENTROPY_ANNEAL_EPISODE <= 0:
+        return ENTROPY_COEF_END
+    frac = min(1.0, ep / ENTROPY_ANNEAL_EPISODE)
+    return ENTROPY_COEF_START + frac * (ENTROPY_COEF_END - ENTROPY_COEF_START)
+
+# Number of episodes accumulated into the rollout buffer before each
+# PPO update, instead of updating after every single episode. A single
+# episode is a small, high-variance sample of the multi-agent dynamics --
+# if that one episode happens to be unusually lopsided (e.g. nearly every
+# agent's decision points to the same direction, whether or not that
+# turns out well), the resulting gradient is strongly and uniformly
+# directional even though each individual (normalized, ratio-clipped)
+# advantage is bounded -- clipping protects against any ONE sample
+# dominating, but not against MANY samples in one episode agreeing by
+# chance. Accumulating several episodes' worth of more varied experience
+# before each update dilutes that effect. Set to 1 to recover the
+# original "update every episode" behavior.
+ROLLOUT_EPISODES = 4   # SCREENING TEST: with LR=1e-4 this collapsed hard around
+                        # ep2280-2300 (danger zone lands at ~update #2300 since
+                        # rollout=1 means 1 episode = 1 update). Now testing whether
+                        # a much lower LR_ACTOR (3e-5) survives that same update-count
+                        # danger zone -- if not, rollout=1's noise floor can't be fixed
+                        # by LR alone and we go back to ROLLOUT_EPISODES=4 for good.
 
 # ── Clustered start (see evac_env.EvacuationEnv) ────────────────────────────────
 # Every episode, all agents start within CLUSTER_RADIUS_HOPS hops of one
@@ -179,6 +247,16 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Networks
 # ═══════════════════════════════════════════════════════════════════════════════
+# NOTE: orthogonal weight initialization was tried here and removed.
+# Across two different (rollout, LR) combinations, adding it made the
+# periodic instability arrive MUCH earlier (rollout=1+LR=3e-5: crisis at
+# ep900 instead of ep2400; rollout=4+LR=3e-4: crisis at ep1300 instead of
+# ep7800), consistent with orthogonal init preserving gradient/activation
+# norm more faithfully across layers than PyTorch's default init -- i.e.
+# stronger, more consistent gradient flow, which for this problem acts like
+# an effective LR increase and accelerates the instability rather than
+# damping it. Back to plain default init.
+
 class Actor(nn.Module):
     """
     Decentralized policy network.
@@ -351,7 +429,7 @@ def evaluate_shortest_path_baseline(env, total_episodes, base_seed):
     return (baseline_arrived_only, baseline_with_timeout, baseline_counts, baseline_rewards,
             baseline_far_frac)
 
-def ppo_update(agent_system, memory):
+def ppo_update(agent_system, memory, entropy_coef=ENTROPY_COEF):
     """
     One PPO update pass over the full rollout buffer collected this episode.
     Runs UPDATE_EPOCHS gradient steps on both Critic and Actor.
@@ -363,6 +441,11 @@ def ppo_update(agent_system, memory):
       surr2     = clip(ratio, 1±ε) * A
       loss      = -min(surr1, surr2) - entropy_coef * H(π)
     Advantages are normalized per batch to stabilize gradient scale.
+
+    entropy_coef: the ENTROPY_COEF value to use for THIS update. Defaults to
+    the (fixed) module constant ENTROPY_COEF for backward compatibility, but
+    the training loop now passes current_entropy_coef(ep) so the entropy
+    bonus can anneal over training (see ENTROPY_COEF_START/_END above).
 
     Returns a dict of this episode's loss/entropy diagnostics (mean and
     last-epoch value across the UPDATE_EPOCHS passes), for logging --
@@ -403,7 +486,7 @@ def ppo_update(agent_system, memory):
         ratios = torch.exp(action_log_probs - logprobs_batch)
         surr1 = ratios * advantages
         surr2 = torch.clamp(ratios, 1 - CLIP_EPSILON, 1 + CLIP_EPSILON) * advantages
-        loss_actor = -torch.min(surr1, surr2).mean() - ENTROPY_COEF * dist_entropy.mean()
+        loss_actor = -torch.min(surr1, surr2).mean() - entropy_coef * dist_entropy.mean()
         agent_system.optimizer_actor.zero_grad()
         loss_actor.backward()
         agent_system.optimizer_actor.step()
@@ -552,7 +635,17 @@ def train():
     history_critic_loss   = []   # diagnostic: mean Critic MSE loss this episode's PPO update
     history_actor_loss    = []   # diagnostic: mean Actor clipped-surrogate loss this episode
     history_entropy       = []   # diagnostic: mean policy entropy this episode
+    history_entropy_coef  = []   # diagnostic: ENTROPY_COEF actually used this episode's
+                                  # update (varies now that it's annealed -- see
+                                  # current_entropy_coef() above; needed to reconstruct
+                                  # entropy_term = entropy_coef * H exactly downstream,
+                                  # e.g. in plot_actor_loss_decomposition.py)
     total_t0 = time.time()
+
+    # Rollout buffer accumulated across ROLLOUT_EPISODES episodes before each
+    # PPO update (see ROLLOUT_EPISODES docstring above). None when empty.
+    rollout_buffer = None
+    episodes_since_update = 0
 
     for ep in range(TOTAL_EPISODES):
         t0 = time.time()
@@ -617,18 +710,51 @@ def train():
             ep_reward += sum(rewards.values())
             if not env.agents or any(truncations.values()): break
 
-        # ── End of episode: compute returns and update networks ───────────────
+        # ── End of episode: compute this episode's returns, then accumulate ────
+        # into the rollout buffer. The PPO update itself only runs every
+        # ROLLOUT_EPISODES episodes (see ROLLOUT_EPISODES docstring), using
+        # the combined, more varied experience of several episodes rather
+        # than just this one -- reduces the chance that one unusually
+        # lopsided episode (e.g. nearly every agent's decision pointing the
+        # same direction that episode, whether or not it turns out well)
+        # dominates a single gradient update on its own. GAE/returns are
+        # still computed per-episode (bootstrapping must respect episode
+        # boundaries), only the timing of the actual network update changes.
         loss_info = None
+        ep_entropy_coef = None
         if len(memory['rewards']) > 0:
             next_value        = mappo_brain.critic(
                 torch.from_numpy(next_state).to(device)).item()
             memory['returns'] = compute_gae(next_value, memory['rewards'],
                                             memory['masks'], memory['values'])
-            loss_info = ppo_update(mappo_brain, memory)
+
+            if rollout_buffer is None:
+                rollout_buffer = {'obs': [], 'state_per_step': [], 'step_index': [],
+                                   'actions': [], 'logprobs': [], 'returns': []}
+            # step_index values are local to this episode's own
+            # state_per_step list (start at 0) -- offset them by how much
+            # is already in the buffer so they still point at the right
+            # entry once this episode's state_per_step is appended after it.
+            offset = len(rollout_buffer['state_per_step'])
+            rollout_buffer['obs'].extend(memory['obs'])
+            rollout_buffer['state_per_step'].extend(memory['state_per_step'])
+            rollout_buffer['step_index'].extend(si + offset for si in memory['step_index'])
+            rollout_buffer['actions'].extend(memory['actions'])
+            rollout_buffer['logprobs'].extend(memory['logprobs'])
+            rollout_buffer['returns'].extend(memory['returns'])
+            episodes_since_update += 1
+
+        is_last_episode = (ep == TOTAL_EPISODES - 1)
+        if rollout_buffer is not None and (episodes_since_update >= ROLLOUT_EPISODES or is_last_episode):
+            ep_entropy_coef = current_entropy_coef(ep)
+            loss_info = ppo_update(mappo_brain, rollout_buffer, entropy_coef=ep_entropy_coef)
+            rollout_buffer = None
+            episodes_since_update = 0
 
         history_critic_loss.append(loss_info['critic_loss_mean'] if loss_info else float('nan'))
         history_actor_loss.append(loss_info['actor_loss_mean'] if loss_info else float('nan'))
         history_entropy.append(loss_info['entropy_mean'] if loss_info else float('nan'))
+        history_entropy_coef.append(ep_entropy_coef if loss_info else float('nan'))
 
         summary = env.summary()
         arrival_arrived_only.append(summary['avg_arrival_time_arrived_only'])
@@ -705,6 +831,7 @@ def train():
             history_critic_loss=history_critic_loss,
             history_actor_loss=history_actor_loss,
             history_entropy=history_entropy,
+            history_entropy_coef=history_entropy_coef,
             baseline_arrived_only=baseline_arrived_only,
             baseline_with_timeout=baseline_with_timeout,
             baseline_counts=baseline_counts,

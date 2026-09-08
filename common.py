@@ -18,7 +18,13 @@ BASE_SPEED   = 1.2    # pedestrian free-flow speed (m/s)
 ROAD_WIDTH   = 5.0    # effective road width (m); used to compute pedestrian density
 REWARD_DEST  = 1.0    # terminal reward given to an agent upon reaching a shelter
 GAMMA        = 0.99   # discount factor (higher = rewards propagate further back in time)
-TOTAL_EPISODES  = 4000
+# Overridable via MAPPO_TOTAL_EPISODES (same pattern as SEED above) so a
+# test run can extend training length without changing this default for
+# every other config. With ROLLOUT_EPISODES>1 in training.py, the actual
+# number of PPO updates is TOTAL_EPISODES / ROLLOUT_EPISODES, so doubling
+# TOTAL_EPISODES roughly restores the update budget a ROLLOUT_EPISODES=1
+# run would have had.
+TOTAL_EPISODES  = int(os.environ.get('MAPPO_TOTAL_EPISODES', 8000))
 MAX_STEPS_EP    = 600  # max steps per episode; slightly generous to allow rerouting
 N_EXEC_AGENTS   = 3000
 N_TRAIN_AGENTS  = N_EXEC_AGENTS

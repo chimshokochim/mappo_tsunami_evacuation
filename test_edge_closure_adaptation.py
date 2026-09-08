@@ -130,8 +130,13 @@ CLOSURE_EDGE         = ('center', 'shelter_near')
 DEPARTURE_WINDOW     = DEPARTURE_WINDOW_FRAC * MAX_STEPS   # == 225
 CLOSURE_START_STEP   = round(0.20 * DEPARTURE_WINDOW)      # == 45
 CLOSURE_END_STEP     = round(0.80 * DEPARTURE_WINDOW)      # == 180
-CLOSURE_DENSITY_FLOOR = 0.9   # fraction of DENSITY_MAX -- ~88% speed drop
-                               # (near-total gridlock, see prior discussion)
+CLOSURE_DENSITY_FLOOR = 1.0   # fraction of DENSITY_MAX -- full jam density,
+                               # speed = SPEED_MIN_ABS (0.01 m/s) for everyone
+                               # on the edge, i.e. effectively closed/crawling
+                               # (at 0.01 m/s, crossing 150m would take far
+                               # longer than the episode horizon, so this is
+                               # a genuine "nobody gets through" closure,
+                               # unlike 0.9 which was only an ~88% slowdown).
 
 # "Recovered" = with-closure value is within this relative fraction of the
 # same-step no-closure (counterfactual) value, e.g. 0.95 means the two

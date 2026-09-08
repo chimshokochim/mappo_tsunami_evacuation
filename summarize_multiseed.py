@@ -108,7 +108,7 @@ def main():
     ax1.legend(fontsize=8); ax1.grid(True, alpha=0.3)
 
     for seed, d in per_seed.items():
-        vals = d.get('history_far_frac')
+        vals = d.get('history_rewards')
         if not vals:
             continue
         eps_x = np.arange(1, len(vals) + 1)
@@ -117,9 +117,8 @@ def main():
             ma = np.convolve(np.nan_to_num(vals, nan=np.nanmean(vals)),
                               np.ones(window) / window, mode='valid')
             ax2.plot(np.arange(window, len(vals) + 1), ma, lw=1.5, label=f'seed={seed}')
-    ax2.set_xlabel('Episode'); ax2.set_ylabel('far_frac, smoothed')
-    ax2.set_title('far_frac across seeds')
-    ax2.set_ylim(-0.05, 1.05)
+    ax2.set_xlabel('Episode'); ax2.set_ylabel('Mean episode return, smoothed')
+    ax2.set_title('Mean episode return across seeds')
     ax2.legend(fontsize=8); ax2.grid(True, alpha=0.3)
 
     plt.tight_layout(); plt.savefig(OUTPUT_PNG, dpi=150); plt.close()
