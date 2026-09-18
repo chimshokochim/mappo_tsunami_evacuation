@@ -7,16 +7,15 @@ import xml.etree.ElementTree as ET
 import math, random, heapq, time, os
 from collections import defaultdict
 import numpy as np
-import pandas as pd
 
 # ── File paths ─────────────────────────────────────────────────────────────────
 OSM_FILE   = 'map.osm'                               # OpenStreetMap road network
 EXCEL_FILE = 'Kochi_Shioe_evacuation_buildings.xlsx' # Shelter locations and capacities
 
 # ── Simulation constants ───────────────────────────────────────────────────────
-BASE_SPEED   = 1.2    # pedestrian free-flow speed (m/s)
+BASE_SPEED   = 1.25   # mean of the per-agent 1.0--1.5 m/s free-flow range
 ROAD_WIDTH   = 5.0    # effective road width (m); used to compute pedestrian density
-REWARD_DEST  = 1.0    # terminal reward given to an agent upon reaching a shelter
+REWARD_DEST  = 0.0    # the stable two-edge model has no terminal arrival bonus
 GAMMA        = 0.99   # discount factor (higher = rewards propagate further back in time)
 # Overridable via MAPPO_TOTAL_EPISODES (same pattern as SEED above) so a
 # test run can extend training length without changing this default for
@@ -24,12 +23,12 @@ GAMMA        = 0.99   # discount factor (higher = rewards propagate further back
 # number of PPO updates is TOTAL_EPISODES / ROLLOUT_EPISODES, so doubling
 # TOTAL_EPISODES roughly restores the update budget a ROLLOUT_EPISODES=1
 # run would have had.
-TOTAL_EPISODES  = int(os.environ.get('MAPPO_TOTAL_EPISODES', 8000))
-MAX_STEPS_EP    = 600  # max steps per episode; slightly generous to allow rerouting
+TOTAL_EPISODES  = 12000
+MAX_STEPS_EP    = 900
 N_EXEC_AGENTS   = 3000
 N_TRAIN_AGENTS  = N_EXEC_AGENTS
-DT              = 5.0     # simulation timestep (seconds)
-MAX_TIME        = 3600    # max simulation time (seconds = 1 hour)
+DT              = 1.0
+MAX_TIME        = MAX_STEPS_EP * DT
 ACTOR_PATH      = 'actor.npy'          # saved actor weights for execution
 GRAPH_PATH      = 'graph_data.pkl'     # cached graph so OSM re-parsing can be skipped
 # Overridable via the MAPPO_TRAIN_SEED environment variable so a runner
@@ -37,7 +36,36 @@ GRAPH_PATH      = 'graph_data.pkl'     # cached graph so OSM re-parsing can be s
 # runs -- each getting its own network initialization AND its own
 # per-episode start/target/speed randomness -- without editing this file
 # between runs. Defaults to 42, unchanged, when the env var isn't set.
-SEED = int(os.environ.get('MAPPO_TRAIN_SEED', 42))
+SEED = 7
+
+# Stable two-edge environment constants.  These names retain the original
+# common.py organization while matching evacuation_env.py exactly.
+NEAR_ROAD_LENGTH = 150.0
+FAR_ROAD_LENGTH = 300.0
+MIN_BASE_SPEED = 1.0
+MAX_BASE_SPEED = 1.5
+FREE_FLOW_DENSITY = 0.1
+MAX_DENSITY = 1.0
+MIN_SPEED_FACTOR = 0.3
+DEPARTURE_FRACTION = 0.25
+CONGESTION_PENALTY = 0.50
+TIME_PENALTY = 0.01
+FAILURE_PENALTY = 25.0
+
+# Shared-network and PPO constants.
+HIDDEN_SIZE = 64
+LR_ACTOR = 1e-4
+LR_CRITIC = 1e-3
+GAE_LAMBDA = 0.95
+PPO_CLIP = 0.2
+PPO_EPOCHS = 4
+MINIBATCH_SIZE = 512
+ROLLOUT_EPISODES = 4
+MAX_GRAD_NORM = 0.5
+ADVANTAGE_EPSILON = 1e-5
+ENTROPY_COEF = 0.05
+ENTROPY_FINAL = 0.01
+ENTROPY_ANNEAL_EPISODES = 9000
 
 
 def haversine(c1, c2):
@@ -128,6 +156,8 @@ def load_evac_data(excel_path, node_coords, road_nodes):
     Each row's (lon, lat) is snapped to the nearest road node.
     Returns: evac_nodes (set of node ids), evac_capacity (dict {node_id: capacity}).
     """
+    import pandas as pd
+
     print(f"Loading evacuation building data ({excel_path})...")
     df=pd.read_excel(excel_path); road_list=list(road_nodes)
     evac_nodes=set(); evac_capacity={}; success=0
