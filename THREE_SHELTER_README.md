@@ -83,6 +83,27 @@ Plot the latest run:
 python plot_three_shelter_diagnostics.py outputs_three_shelter_annealed
 ```
 
+## Four-seed robustness run
+
+The seed runner reuses matching completed runs, trains only missing seeds, and
+automatically resumes any matching `checkpoint_latest.pt`. For example, the
+existing seed-7 run can be reused while seeds 17, 27, and 37 are trained:
+
+```powershell
+python three_shelter_seed_convergence.py `
+  --train `
+  --seeds 7 17 27 37 `
+  --episodes 12000 `
+  --entropy-mode annealed `
+  --output-dir outputs_three_shelter_seed_sweep `
+  --include outputs_three_shelter_annealed
+```
+
+If training is interrupted, run exactly the same command again. Completed
+seeds are skipped and the interrupted seed continues from its rolling
+checkpoint. After all four runs finish, the script writes a comparison PNG and
+a JSON summary containing the final-100-episode statistics.
+
 ## Verification
 
 ```powershell
