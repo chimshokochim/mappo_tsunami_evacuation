@@ -54,6 +54,29 @@ python three_shelter_training.py `
 Four complete episodes are collected per PPO update, giving 12,000 shelter
 choice transitions per normal update and 3,000 updates over 12,000 episodes.
 
+### Rolling checkpoint and resume
+
+Every 25 PPO updates (100 episodes), training atomically replaces one file:
+
+```text
+checkpoint_latest.pt
+```
+
+No numbered checkpoint history is accumulated. The file is written via a
+temporary file and atomic replacement, and it is deleted automatically after
+the complete run has saved its final Actor, Critic, diagnostics, and configs.
+Resume an interrupted run in place with:
+
+```powershell
+python three_shelter_training.py `
+  --resume outputs_three_shelter_annealed\run_YYYYMMDD_HHMMSS_annealed_seed7
+```
+
+The original total episode target is read from the checkpoint. To deliberately
+extend it, also pass a larger `--episodes` value. The checkpoint contains both
+networks, both Adam optimizers, the next episode and update counts, diagnostics,
+configs, and Python/NumPy/PyTorch/environment random states.
+
 Plot the latest run:
 
 ```powershell

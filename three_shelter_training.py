@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pickle
 import random
 from dataclasses import asdict, dataclass
@@ -332,7 +333,10 @@ def collect_episode(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--episodes", type=int, default=12000)
+    parser.add_argument(
+        "--episodes", type=int,
+        help="total target episodes (new runs default to 12000; resume keeps the saved target)",
+    )
     parser.add_argument("--num-agents", type=int, default=3000)
     parser.add_argument("--max-steps", type=int, default=900)
     parser.add_argument("--road-lengths", type=float, nargs=3, default=(150.0, 225.0, 300.0))
@@ -343,6 +347,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs_three_shelter"))
     parser.add_argument("--log-every-updates", type=int, default=1)
     parser.add_argument("--minibatch-size", type=int, default=512)
+    parser.add_argument(
+        "--checkpoint-every-updates", type=int, default=25,
+        help="atomically replace one rolling checkpoint every N PPO updates; 0 disables",
+    )
+    parser.add_argument(
+        "--resume", type=Path,
+        help="run directory or checkpoint_latest.pt to resume in place",
+    )
+    parser.add_argument(
+        "--stop-after-updates", type=int,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args()
 
 
@@ -362,6 +378,77 @@ def make_run_directory(parent: Path, mode: str, seed: int) -> Path:
     return run_dir
 
 
+def resolve_checkpoint(path: Path) -> Path:
+    checkpoint = path / "checkpoint_latest.pt" if path.is_dir() else path
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint}")
+    return checkpoint
+
+
+def save_checkpoint(
+    checkpoint_path: Path,
+    *,
+    next_episode: int,
+    target_episodes: int,
+    env: ThreeShelterEnv,
+    agent: MAPPOAgent,
+    diagnostics: dict,
+    seed: int,
+) -> None:
+    """Atomically replace the single rolling checkpoint.
+
+    This is called only immediately after a PPO update, when the rollout
+    buffer is empty. A partial four-episode rollout is therefore never mixed
+    with a resumed run.
+    """
+    temporary_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    payload = {
+        "checkpoint_version": 1,
+        "next_episode": int(next_episode),
+        "target_episodes": int(target_episodes),
+        "seed": int(seed),
+        "environment_config": asdict(env.config),
+        "ppo_config": asdict(agent.config),
+        "actor_state_dict": agent.actor.state_dict(),
+        "critic_state_dict": agent.critic.state_dict(),
+        "actor_optimizer_state_dict": agent.actor_optimizer.state_dict(),
+        "critic_optimizer_state_dict": agent.critic_optimizer.state_dict(),
+        "update_count": int(agent.update_count),
+        "diagnostics": diagnostics,
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_random_state": torch.get_rng_state(),
+        "torch_cuda_random_state_all": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        ),
+        "environment_random_state": env.rng.bit_generator.state,
+    }
+    torch.save(payload, temporary_path)
+    os.replace(temporary_path, checkpoint_path)
+
+
+def restore_checkpoint(
+    checkpoint: dict,
+    env: ThreeShelterEnv,
+    agent: MAPPOAgent,
+) -> None:
+    if checkpoint.get("checkpoint_version") != 1:
+        raise ValueError("Unsupported checkpoint version")
+    agent.actor.load_state_dict(checkpoint["actor_state_dict"])
+    agent.critic.load_state_dict(checkpoint["critic_state_dict"])
+    agent.actor_optimizer.load_state_dict(checkpoint["actor_optimizer_state_dict"])
+    agent.critic_optimizer.load_state_dict(checkpoint["critic_optimizer_state_dict"])
+    agent.update_count = int(checkpoint["update_count"])
+    random.setstate(checkpoint["python_random_state"])
+    np.random.set_state(checkpoint["numpy_random_state"])
+    torch.set_rng_state(checkpoint["torch_random_state"].cpu())
+    if torch.cuda.is_available() and checkpoint["torch_cuda_random_state_all"] is not None:
+        torch.cuda.set_rng_state_all([
+            state.cpu() for state in checkpoint["torch_cuda_random_state_all"]
+        ])
+    env.rng.bit_generator.state = checkpoint["environment_random_state"]
+
+
 def append_metrics(target: dict[str, list], source: dict, keys: tuple[str, ...]) -> None:
     for key in keys:
         target[key].append(source[key])
@@ -369,31 +456,58 @@ def append_metrics(target: dict[str, list], source: dict, keys: tuple[str, ...])
 
 def main() -> None:
     args = parse_args()
-    if args.episodes <= 0 or args.num_agents <= 0 or args.max_steps <= 0:
-        raise ValueError("episodes, num-agents, and max-steps must be positive")
+    if args.episodes is not None and args.episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if args.num_agents <= 0 or args.max_steps <= 0:
+        raise ValueError("num-agents and max-steps must be positive")
     if args.log_every_updates <= 0 or args.minibatch_size <= 0:
         raise ValueError("log-every-updates and minibatch-size must be positive")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    if args.checkpoint_every_updates < 0:
+        raise ValueError("checkpoint-every-updates must be non-negative")
+    if args.stop_after_updates is not None and args.stop_after_updates <= 0:
+        raise ValueError("stop-after-updates must be positive")
 
     device = choose_device(args.device)
-    env_config = ThreeShelterConfig(
-        num_agents=args.num_agents,
-        max_steps=args.max_steps,
-        road_lengths=tuple(args.road_lengths),
-        road_width=args.road_width,
-    )
-    ppo_config = PPOConfig(
-        entropy_mode=args.entropy_mode,
-        minibatch_size=args.minibatch_size,
-    )
-    env = ThreeShelterEnv(env_config, seed=args.seed)
+    checkpoint_data = None
+    resumed_from = None
+    if args.resume is not None:
+        checkpoint_path = resolve_checkpoint(args.resume)
+        checkpoint_data = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
+        seed = int(checkpoint_data["seed"])
+        total_episodes = int(
+            checkpoint_data["target_episodes"] if args.episodes is None else args.episodes
+        )
+        env_config = ThreeShelterConfig(**checkpoint_data["environment_config"])
+        ppo_config = PPOConfig(**checkpoint_data["ppo_config"])
+        run_dir = checkpoint_path.parent
+        resumed_from = str(checkpoint_path.resolve())
+    else:
+        seed = args.seed
+        total_episodes = 12000 if args.episodes is None else args.episodes
+        env_config = ThreeShelterConfig(
+            num_agents=args.num_agents,
+            max_steps=args.max_steps,
+            road_lengths=tuple(args.road_lengths),
+            road_width=args.road_width,
+        )
+        ppo_config = PPOConfig(
+            entropy_mode=args.entropy_mode,
+            minibatch_size=args.minibatch_size,
+        )
+        run_dir = make_run_directory(args.output_dir, args.entropy_mode, seed)
+        checkpoint_path = run_dir / "checkpoint_latest.pt"
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    env = ThreeShelterEnv(env_config, seed=seed)
     agent = MAPPOAgent(ppo_config, device)
     buffer = RolloutBuffer(ppo_config.rollout_episodes)
-    run_dir = make_run_directory(args.output_dir, args.entropy_mode, args.seed)
 
     episode_keys = (
         "mean_episode_return_per_agent", "arrived_only_mean_arrival_time",
@@ -409,23 +523,42 @@ def main() -> None:
         "sampled_near_fraction", "sampled_middle_fraction", "sampled_far_fraction",
         "approx_kl", "clip_fraction", "transition_count",
     )
-    diagnostics = {
-        "environment_config": asdict(env_config),
-        "ppo_config": asdict(ppo_config),
-        "seed": args.seed,
-        "entropy_mode": args.entropy_mode,
-        "device": str(device),
-        "shelters": list(SHELTER_NAMES),
-        "episode": list(range(1, args.episodes + 1)),
-        "episode_metrics": {key: [] for key in episode_keys},
-        "update": [], "update_episode": [],
-        "update_metrics": {key: [] for key in update_keys},
-    }
+    if checkpoint_data is not None:
+        restore_checkpoint(checkpoint_data, env, agent)
+        diagnostics = checkpoint_data["diagnostics"]
+        diagnostics["device"] = str(device)
+        start_episode = int(checkpoint_data["next_episode"])
+        if start_episode >= total_episodes:
+            raise ValueError(
+                f"Checkpoint already reached episode {start_episode}; "
+                f"requested total is {total_episodes}"
+            )
+        print(
+            f"Resuming {checkpoint_path.resolve()} at episode {start_episode + 1}/"
+            f"{total_episodes}, update={agent.update_count}",
+            flush=True,
+        )
+    else:
+        start_episode = 0
+        diagnostics = {
+            "environment_config": asdict(env_config),
+            "ppo_config": asdict(ppo_config),
+            "seed": seed,
+            "entropy_mode": ppo_config.entropy_mode,
+            "device": str(device),
+            "shelters": list(SHELTER_NAMES),
+            "episode": [],
+            "episode_metrics": {key: [] for key in episode_keys},
+            "update": [], "update_episode": [],
+            "update_metrics": {key: [] for key in update_keys},
+        }
     recent_metrics: list[dict] = []
-    for episode_index in range(args.episodes):
+    updates_this_invocation = 0
+    for episode_index in range(start_episode, total_episodes):
         batch, metrics = collect_episode(env, agent)
         buffer.add(batch)
         recent_metrics.append(metrics)
+        diagnostics["episode"].append(episode_index + 1)
         append_metrics(diagnostics["episode_metrics"], metrics, episode_keys)
         if not buffer.ready:
             continue
@@ -434,6 +567,7 @@ def main() -> None:
         diagnostics["update"].append(update_metrics["update"])
         diagnostics["update_episode"].append(episode_index + 1)
         append_metrics(diagnostics["update_metrics"], update_metrics, update_keys)
+        updates_this_invocation += 1
 
         if agent.update_count % args.log_every_updates == 0:
             reward = float(np.mean([row["mean_agent_reward"] for row in recent_metrics]))
@@ -442,9 +576,9 @@ def main() -> None:
             ]))
             arrived = int(round(np.mean([row["arrival_count"] for row in recent_metrics])))
             print(
-                f"episode={episode_index + 1:05d}/{args.episodes} "
+                f"episode={episode_index + 1:05d}/{total_episodes} "
                 f"update={agent.update_count:05d} reward={reward:.3f} "
-                f"arrival_time={arrival:.1f}s arrived={arrived}/{args.num_agents} "
+                f"arrival_time={arrival:.1f}s arrived={arrived}/{env_config.num_agents} "
                 f"sampled=(near={update_metrics['sampled_near_fraction']:.3f},"
                 f"mid={update_metrics['sampled_middle_fraction']:.3f},"
                 f"far={update_metrics['sampled_far_fraction']:.3f}) "
@@ -460,6 +594,33 @@ def main() -> None:
                 flush=True,
             )
         recent_metrics.clear()
+
+        periodic_checkpoint = (
+            args.checkpoint_every_updates > 0
+            and agent.update_count % args.checkpoint_every_updates == 0
+        )
+        requested_pause = (
+            args.stop_after_updates is not None
+            and updates_this_invocation >= args.stop_after_updates
+        )
+        if periodic_checkpoint or requested_pause:
+            save_checkpoint(
+                checkpoint_path,
+                next_episode=episode_index + 1,
+                target_episodes=total_episodes,
+                env=env,
+                agent=agent,
+                diagnostics=diagnostics,
+                seed=seed,
+            )
+            print(
+                f"Saved rolling checkpoint: {checkpoint_path.resolve()} "
+                f"(next episode {episode_index + 2})",
+                flush=True,
+            )
+        if requested_pause:
+            print("Stopped at a safe post-update checkpoint by request.", flush=True)
+            return
 
     diagnostics["unused_complete_episodes"] = buffer.episode_count
     torch.save(agent.actor.state_dict(), run_dir / "actor.pt")
@@ -477,8 +638,10 @@ def main() -> None:
             "topology": "three_shelter_star",
             "capacity_limits": False,
             "road_blockage": False,
-            "seed": args.seed,
-            "entropy_mode": args.entropy_mode,
+            "seed": seed,
+            "entropy_mode": ppo_config.entropy_mode,
+            "resumed_from": resumed_from,
+            "checkpoint_every_updates": args.checkpoint_every_updates,
         }, indent=2), encoding="utf-8",
     )
     if buffer.episode_count:
@@ -486,6 +649,8 @@ def main() -> None:
             f"Skipped final {buffer.episode_count} episode(s): an update requires "
             f"{ppo_config.rollout_episodes} complete episodes.", flush=True,
         )
+    checkpoint_path.unlink(missing_ok=True)
+    checkpoint_path.with_name(checkpoint_path.name + ".tmp").unlink(missing_ok=True)
     print(f"Saved new run to {run_dir.resolve()}")
 
 

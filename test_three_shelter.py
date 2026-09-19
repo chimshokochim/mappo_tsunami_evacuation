@@ -1,6 +1,8 @@
 """Diagnostic tests for the capacity-free three-shelter extension."""
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import torch
@@ -13,6 +15,8 @@ from three_shelter_training import (
     PPOConfig,
     RolloutBuffer,
     collect_episode,
+    restore_checkpoint,
+    save_checkpoint,
 )
 
 
@@ -102,6 +106,34 @@ class ThreeShelterTests(unittest.TestCase):
         ))
         self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
         self.assertEqual(metrics["transition_count"], 96)
+
+    def test_single_atomic_checkpoint_can_restore(self):
+        config = PPOConfig(minibatch_size=32)
+        env = ThreeShelterEnv(ThreeShelterConfig(num_agents=24), seed=12)
+        agent = MAPPOAgent(config, torch.device("cpu"))
+        agent.update_count = 3
+        diagnostics = {"episode": [1, 2, 3, 4], "marker": "first"}
+        expected = [parameter.detach().clone() for parameter in agent.actor.parameters()]
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint_latest.pt"
+            save_checkpoint(
+                path, next_episode=4, target_episodes=8, env=env,
+                agent=agent, diagnostics=diagnostics, seed=12,
+            )
+            diagnostics["marker"] = "replacement"
+            save_checkpoint(
+                path, next_episode=4, target_episodes=8, env=env,
+                agent=agent, diagnostics=diagnostics, seed=12,
+            )
+            self.assertEqual([item.name for item in Path(directory).iterdir()], [path.name])
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertEqual(checkpoint["diagnostics"]["marker"], "replacement")
+            restored_env = ThreeShelterEnv(ThreeShelterConfig(num_agents=24), seed=99)
+            restored_agent = MAPPOAgent(config, torch.device("cpu"))
+            restore_checkpoint(checkpoint, restored_env, restored_agent)
+            self.assertEqual(restored_agent.update_count, 3)
+            for old, new in zip(expected, restored_agent.actor.parameters()):
+                self.assertTrue(torch.equal(old, new.detach()))
 
 
 if __name__ == "__main__":
