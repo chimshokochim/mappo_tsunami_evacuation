@@ -1,5 +1,8 @@
 # Capacity-free three-shelter star experiment
 
+For the complete software architecture, file/function map, and equation-by-equation
+MAPPO description, see [`THREE_SHELTER_CODE_ARCHITECTURE.md`](THREE_SHELTER_CODE_ARCHITECTURE.md).
+
 This is the first extension after the frozen `two-shelter-capacity-v1`
 checkpoint.  It deliberately changes only the number of independent routes:
 
