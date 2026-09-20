@@ -507,3 +507,346 @@ repeat for 4 PPO epochs:
 8. Capacity and blockage are trained separately; blockage is zero here.
 9. Fixed-probability sweeps are evaluation baselines only and never force the
    Actor's action distribution.
+
+## 7. Detailed clarifications
+
+### 7.1 Actor and Critic inputs
+
+The Actor receives a local, decision-relevant 7-dimensional observation:
+
+1. normalized near-edge density;
+2. normalized far-edge density;
+3. remaining waiting fraction, `waiting_agents / 3000`;
+4. remaining near-shelter capacity / 3000;
+5. remaining far-shelter capacity / 3000;
+6. `clip(remaining near capacity / remaining waiting agents, 0, 1)`;
+7. `clip(remaining far capacity / remaining waiting agents, 0, 1)`.
+
+The Critic receives a centralized 9-dimensional state:
+
+1. normalized near-edge density;
+2. normalized far-edge density;
+3. remaining waiting fraction, `waiting_agents / 3000`;
+4. travelling-agent fraction;
+5. failed-agent fraction;
+6. remaining near-shelter capacity / 3000;
+7. remaining far-shelter capacity / 3000;
+8. `clip(remaining near capacity / remaining waiting agents, 0, 1)`;
+9. `clip(remaining far capacity / remaining waiting agents, 0, 1)`.
+
+Thus, the Critic additionally sees the global travelling and failure fractions.
+The Actor does not see them. This difference implements centralized training
+with decentralized execution (CTDE).
+
+### 7.2 Neural-network layers and parameter counts
+
+Both networks are multilayer perceptrons (MLPs):
+
+```text
+Actor:  7 inputs -> Linear(7,64) -> Tanh -> Linear(64,64) -> Tanh
+        -> Linear(64,2) -> Softmax -> P(near), P(far)
+
+Critic: 9 inputs -> Linear(9,64) -> Tanh -> Linear(64,64) -> Tanh
+        -> Linear(64,1) -> scalar V(s)
+```
+
+A Linear layer computes
+
+```math
+y=Wx+b.
+```
+
+Every output neuron takes a weighted sum of all inputs and adds a bias. The
+matrix `W` and vector `b` are trainable. A sequence of Linear layers without a
+nonlinear activation would still be equivalent to one Linear layer, so `Tanh`
+is inserted between them.
+
+`Tanh` is applied element by element:
+
+```math
+\tanh(x)=\frac{e^x-e^{-x}}{e^x+e^{-x}}.
+```
+
+It maps each hidden value to `(-1,1)` and supplies the nonlinearity required to
+represent curved decision boundaries and interactions between inputs. `Tanh`
+has no trainable parameters.
+
+The Actor's final two numbers are logits. Softmax converts them to action
+probabilities:
+
+```math
+\pi(a\mid o)=\frac{e^{z_a}}{e^{z_{near}}+e^{z_{far}}}.
+```
+
+The two outputs are nonnegative and sum to one. Softmax also has no trainable
+parameters. The Critic has no final activation, because a value estimate must
+be able to take any real value, including a large negative return.
+
+Parameter counts include one weight for every connection and one bias for every
+output unit:
+
+| Network | Layer | Calculation | Parameters |
+|---|---|---:|---:|
+| Actor | Linear 7 -> 64 | `7*64 + 64` | 512 |
+| Actor | Linear 64 -> 64 | `64*64 + 64` | 4,160 |
+| Actor | Linear 64 -> 2 | `64*2 + 2` | 130 |
+| **Actor total** | | | **4,802** |
+| Critic | Linear 9 -> 64 | `9*64 + 64` | 640 |
+| Critic | Linear 64 -> 64 | `64*64 + 64` | 4,160 |
+| Critic | Linear 64 -> 1 | `64*1 + 1` | 65 |
+| **Critic total** | | | **4,865** |
+| **Combined total** | | | **9,667** |
+
+### 7.3 Horizon, environment steps, and the absence of `step()`
+
+The **horizon** is the maximum simulated duration of one episode. Here it is
+`max_steps=900` with `dt=1` second, so one episode can last at most 900 seconds.
+An agent that has not reached an accepted shelter by then is a timeout and is
+marked as failed. For the all-agent arrival-time statistic, its arrival time is
+represented by the horizon value of 900 seconds.
+
+The environment does advance one simulation step, but it is not packaged in a
+single Gym-style `step(action)` method. Its responsibilities are separated into:
+
+1. `decision_batch()` -- find agents whose departure decision is due;
+2. `commit(ids, actions)` -- reserve shelter space and commit their choices;
+3. `advance(gamma)` -- move travelling agents and accumulate one time step of
+   reward;
+4. `finished()` -- test whether the episode has ended.
+
+Therefore, `advance()` contains the main one-second state-transition role that
+would normally be inside `step()`. This split supports asynchronous departure
+times and careful sequential processing when a simultaneous decision batch
+crosses a shelter-capacity boundary.
+
+### 7.4 Normalized excess congestion
+
+For physical density `rho` in agents per square metre, the environment uses
+
+```math
+C_e(t)=\operatorname{clip}\left(
+\frac{\rho_e(t)-\rho_{free}}{\rho_{max}-\rho_{free}},0,1
+\right),
+```
+
+or equivalently
+
+```math
+C_e(t)=
+\begin{cases}
+0, & \rho_e(t)\le 0.1,\\
+\dfrac{\rho_e(t)-0.1}{0.9}, & 0.1<\rho_e(t)<1.0,\\
+1, & \rho_e(t)\ge 1.0.
+\end{cases}
+```
+
+![Normalized excess congestion](normalized_excess_congestion.png)
+
+The current values are `rho_free=0.1` and **`rho_max=1.0 agents/m^2`**.
+`rho_max` is a normalization and speed-saturation reference, not a hard road
+capacity: the physical density can exceed 1.0, but `C_e(t)` remains 1. With the
+current speed rule, that corresponds to the minimum speed factor `0.3`.
+
+### 7.5 Expanding the team reward-to-go
+
+For an agent departing at time `t`, the recursive equation is
+
+```math
+G_t^{team}=\bar r_t+\gamma G_{t+1}^{team}.
+```
+
+Repeated substitution gives
+
+```math
+\begin{aligned}
+G_t^{team}
+&=\bar r_t+\gamma G_{t+1}^{team}\\
+&=\bar r_t+\gamma(\bar r_{t+1}+\gamma G_{t+2}^{team})\\
+&=\bar r_t+\gamma\bar r_{t+1}+\gamma^2G_{t+2}^{team}\\
+&=\bar r_t+\gamma\bar r_{t+1}+\gamma^2\bar r_{t+2}+\cdots
+  +\gamma^{T-t}\bar r_T.
+\end{aligned}
+```
+
+Written all the way from the first time step of a 900-step episode:
+
+```math
+G_1^{team}=\bar r_1+0.99\bar r_2+0.99^2\bar r_3+
+\cdots+0.99^{898}\bar r_{899}+0.99^{899}\bar r_{900}.
+```
+
+Here `bar r_t` is the system-wide mean reward at time `t`. In practice each
+agent receives the suffix beginning at its own departure time, not necessarily
+at time 1.
+
+### 7.6 Bootstrap and the terminal macro-transition
+
+**Bootstrapping** means using the Critic's estimate of an unobserved future
+return, such as
+
+```math
+r_t+\gamma V(s_{t+1}),
+```
+
+instead of calculating the target entirely from rewards that actually occurred.
+For this problem, one shelter choice is stored as one terminal macro-transition:
+`done=1` and `next_value=0`. Therefore the target does not bootstrap through a
+later agent decision, another agent, or the next episode. The advantage is
+
+```math
+A_i=G_i-V(s_i).
+```
+
+### 7.7 Which quantities are clipped?
+
+There are several unrelated meanings of "clip":
+
+| Mechanism | Actor | Critic | Meaning |
+|---|---:|---:|---|
+| PPO probability-ratio clipping | yes | no | limits the Actor surrogate objective to ratio `1 +/- 0.2` |
+| clipped value loss | no | no | would limit movement relative to the old value prediction |
+| gradient-norm clipping | yes | yes | rescales a large gradient vector to norm 0.5 |
+| action mask | yes | no | removes physically unavailable actions; it is not numerical clipping |
+| observation clipping | input | input | bounds normalized density/capacity ratios to `[0,1]` |
+
+Thus, PPO ratio clipping is used only for the advantage-weighted Actor update.
+The Critic uses ordinary half MSE and no clipped value loss. However, the
+Critic still uses gradient-norm clipping, which is a different safety mechanism.
+
+No clipped value loss does **not** mean that the Critic can change by an
+arbitrary amount in one optimizer step. Its Adam learning rate is `1e-3`, its
+gradient norm is capped at `0.5`, and updates use finite minibatches. It means
+only that there is no explicit PPO-style constraint of the form
+`V_new in [V_old-epsilon, V_old+epsilon]`. Multiple minibatch steps can still
+accumulate a substantial change over one PPO update.
+
+For gradient vector `g`, the implementation applies
+
+```math
+g\leftarrow
+\begin{cases}
+g, & \lVert g\rVert_2\le0.5,\\
+g\dfrac{0.5}{\lVert g\rVert_2}, & \lVert g\rVert_2>0.5.
+\end{cases}
+```
+
+This preserves the gradient direction while reducing its magnitude. It does
+not clamp the network weights, outputs, or loss values.
+
+### 7.8 Reject mode and PPO ratio
+
+Reject mode does not mask a shelter just because it is full. With road blockage
+disabled, the stored action mask is normally `[1,1]`, and the usual PPO ratio
+
+```math
+r_i(\theta)=
+\frac{\pi_\theta(a_i\mid o_i)}{\pi_{old}(a_i\mid o_i)}
+```
+
+is calculated for near and far choices, including a choice later rejected by
+capacity. The rejected choice affects learning through its return and
+advantage. By contrast, an action mask concerns physical availability, such as
+a road closure.
+
+### 7.9 Entropy annealing
+
+The Actor loss contains an entropy bonus:
+
+```math
+\mathcal L_{actor}
+=-\mathbb E[\min(r_iA_i,\operatorname{clip}(r_i,0.8,1.2)A_i)]
+-\beta(e)\mathbb E[H(\pi_\theta(\cdot\mid o_i))].
+```
+
+Because this loss is minimized, the negative entropy term rewards a broad action
+distribution. Its coefficient decreases linearly with episode `e`:
+
+```math
+\beta(e)=0.05+min\left(\frac{e}{9000},1\right)(0.01-0.05).
+```
+
+Examples are `beta(0)=0.05`, `beta(4500)=0.03`, and `beta(e)=0.01` from episode
+9000 onward. Early training therefore emphasizes exploration more strongly;
+later training allows the return-driven PPO term to dominate more, while a
+small entropy incentive remains. Annealing does not change the learning rate,
+PPO clipping range, or probabilities directly. The coefficient is computed
+when a four-episode rollout becomes ready and is held fixed throughout the four
+PPO epochs of that update.
+
+### 7.10 ValueNorm and PopArt
+
+Neither is currently used.
+
+- **ValueNorm** keeps running return-target mean `mu` and standard deviation
+  `sigma` and trains the Critic on approximately `(G-mu)/(sigma+epsilon)`.
+  Predictions are converted back to the original scale when needed. It is
+  useful when target magnitudes are large or vary substantially.
+- **PopArt** also normalizes changing targets, but compensates the Critic's
+  final-layer weights and bias whenever the normalization statistics change.
+  Consequently, the network's unnormalized predictions are preserved. It is
+  particularly useful for non-stationary reward scales, curricula, or tasks
+  with very different return magnitudes.
+
+They can improve numerical stability of value learning, but they do not repair
+an incorrect return definition, missing observations, or a credit-assignment
+problem. Their need should be judged with value/target scale and explained
+variance diagnostics.
+
+### 7.11 Half MSE, four PPO epochs, and diagnostics
+
+The Critic loss is called **half MSE** because
+
+```math
+\mathcal L_{critic}=\frac12\frac1B\sum_i(V(s_i)-G_i)^2.
+```
+
+The factor `1/2` cancels the factor 2 produced by differentiating the square,
+so the derivative with respect to one prediction is proportional to `V-G`.
+Half MSE and ordinary MSE have the same optimum; only the gradient scale differs.
+
+One update collects four complete episodes: `4*3000=12,000` transitions. The
+same batch is then processed for **four PPO epochs**. Each PPO epoch creates a
+new random permutation and uses every transition once in minibatches of 512:
+23 full minibatches plus one minibatch of 224. Thus every transition is used
+four times per update, and Actor and Critic each receive `24*4=96` optimizer
+steps. A PPO epoch is not an environment episode.
+
+**Diagnostics** are measurements recorded to understand and debug training;
+they are not an additional optimization method. They include episode return,
+training return target, arrival times, route fractions, failures, capacity
+rejections, reservations, Actor/Critic losses, entropy and its coefficient,
+approximate KL divergence, clip fraction, and action probabilities. They are
+saved in `diagnostics.pkl` and used to identify convergence or instability.
+
+### 7.12 Why the individual failure penalty is not averaged away
+
+The direct capacity-failure term is constructed per transition:
+
+```math
+G_i=G_{\tau_i}^{team}-500F_i,
+\qquad
+F_i=\begin{cases}1,&\text{agent i failed},\\0,&\text{otherwise}.
+\end{cases}
+```
+
+Only the failed agent's sample receives `-500`. The Actor loss is eventually a
+mean across samples, but each sample contributes its own gradient:
+
+```math
+\nabla_\theta\mathcal L
+\quad\text{contains}\quad
+-\frac1B\sum_i A_i\nabla_\theta\log\pi_\theta(a_i\mid o_i).
+```
+
+Therefore, the failed sample's large negative advantage specifically reduces
+the probability of **its chosen action under its observed state**. Averaging
+sums and scales these sample-specific gradients; it does not first replace the
+individual `F_i` values by their population mean.
+
+The credit assignment would indeed remain poor if the implementation instead
+added `-500*mean(F)` equally to every agent. That is not what it does. The
+current solution is not perfect causal attribution: shared network parameters,
+similar observations, and advantage normalization still couple agents. But the
+individual failure vector provides much more direct credit than a team-averaged
+failure penalty, while the team reward-to-go handles the congestion externality
+created by collective route choices.
