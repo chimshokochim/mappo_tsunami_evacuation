@@ -3,6 +3,10 @@
 This document records the reproducible state of the two-shelter experiment
 before development moves to a larger network.
 
+For the software architecture, complete file/function map, and mathematical
+MAPPO derivation, see
+[`TWO_SHELTER_CAPACITY_CODE_ARCHITECTURE.md`](TWO_SHELTER_CAPACITY_CODE_ARCHITECTURE.md).
+
 ## Source checkpoint
 
 - Repository: `https://github.com/chimshokochim/mappo_tsunami_evacuation`
