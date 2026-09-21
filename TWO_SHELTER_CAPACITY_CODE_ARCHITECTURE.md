@@ -619,6 +619,13 @@ would normally be inside `step()`. This split supports asynchronous departure
 times and careful sequential processing when a simultaneous decision batch
 crosses a shelter-capacity boundary.
 
+Agents may depart only during the first quarter of the horizon. With
+`departure_window_fraction=0.25`, `max_steps=900`, and `dt=1` second, departure
+steps are sampled uniformly as integers from 0 through 224. Thus all agents
+depart during the first 225 seconds, or **3 minutes 45 seconds**, of the
+15-minute episode. The remaining 11 minutes 15 seconds allow travelling agents
+to arrive or time out; they do not create new departures.
+
 ### 7.4 Normalized excess congestion
 
 For physical density `rho` in agents per square metre, the environment uses
@@ -646,6 +653,18 @@ The current values are `rho_free=0.1` and **`rho_max=1.0 agents/m^2`**.
 `rho_max` is a normalization and speed-saturation reference, not a hard road
 capacity: the physical density can exceed 1.0, but `C_e(t)` remains 1. With the
 current speed rule, that corresponds to the minimum speed factor `0.3`.
+
+For agent `i` with its fixed base speed `v_i^0`, the movement rule is
+
+```math
+v_i(t)=v_i^0[1-(1-0.3)C_e(t-1)]
+=v_i^0[1-0.7C_e(t-1)].
+```
+
+Base speed is sampled once per episode from `Uniform(1.0,1.5)` m/s. Movement
+uses the previous step's density, which is why the formula contains `t-1`.
+
+![Walking speed versus edge density](speed_density_relationship.png)
 
 ### 7.5 Expanding the team reward-to-go
 
@@ -678,6 +697,16 @@ G_1^{team}=\bar r_1+0.99\bar r_2+0.99^2\bar r_3+
 Here `bar r_t` is the system-wide mean reward at time `t`. In practice each
 agent receives the suffix beginning at its own departure time, not necessarily
 at time 1.
+
+In particular, an agent departing at step 5 receives
+
+```math
+G_5^{team}=\bar r_5+0.99\bar r_6+0.99^2\bar r_7+\cdots.
+```
+
+It does **not** start with `0.99^4 r_5`. The factor `0.99^4` appears on `r_5`
+only when `r_5` is viewed from time 1 inside `G_1`. Discount exponents restart
+at zero at the time from which the return is evaluated.
 
 ### 7.6 Bootstrap and the terminal macro-transition
 
@@ -732,6 +761,13 @@ g\dfrac{0.5}{\lVert g\rVert_2}, & \lVert g\rVert_2>0.5.
 
 This preserves the gradient direction while reducing its magnitude. It does
 not clamp the network weights, outputs, or loss values.
+
+The purpose is to prevent an unusual minibatch, a large failure advantage, or a
+large Critic error from causing one disproportionately large parameter update.
+Such a jump can move the policy far away from the data-generating policy or make
+the value estimates oscillate. Gradient clipping acts as a safety valve: small
+gradients are untouched, while only gradients whose global norm exceeds 0.5 are
+rescaled. For example, a norm-10 gradient is multiplied by `0.5/10=0.05`.
 
 ### 7.8 Reject mode and PPO ratio
 
@@ -792,6 +828,29 @@ an incorrect return definition, missing observations, or a credit-assignment
 problem. Their need should be judged with value/target scale and explained
 variance diagnostics.
 
+### 7.10.1 Where the learning rate appears
+
+After backpropagation and gradient-norm clipping, Adam applies a parameter
+update. In simplified form,
+
+```math
+\begin{aligned}
+m_k&=\beta_1m_{k-1}+(1-\beta_1)g_k,\\
+v_k&=\beta_2v_{k-1}+(1-\beta_2)g_k^2,\\
+\hat m_k&=m_k/(1-\beta_1^k),\\
+\hat v_k&=v_k/(1-\beta_2^k),\\
+\theta_{k+1}&=\theta_k-\alpha
+\frac{\hat m_k}{\sqrt{\hat v_k}+\epsilon}.
+\end{aligned}
+```
+
+Here `g_k` is the clipped gradient and `alpha` is the learning rate. The current
+values are `alpha_actor=1e-4` and `alpha_critic=1e-3`. Adam's moving first and
+second moments give each parameter an adaptive effective step, while `alpha`
+sets the overall scale. The learning rate is therefore not part of the forward
+pass or reward calculation; it controls how far parameters move after the loss
+gradient has been calculated.
+
 ### 7.11 Half MSE, four PPO epochs, and diagnostics
 
 The Critic loss is called **half MSE** because
@@ -850,3 +909,42 @@ similar observations, and advantage normalization still couple agents. But the
 individual failure vector provides much more direct credit than a team-averaged
 failure penalty, while the team reward-to-go handles the congestion externality
 created by collective route choices.
+
+Advantage normalization also does not average away agent identity. First, each
+sample keeps its own value
+
+```math
+A_i=G_i-V(s_i).
+```
+
+The batch statistics are then used only for an affine rescaling:
+
+```math
+\tilde A_i=\frac{A_i-\operatorname{mean}(A)}
+{\operatorname{std}(A)+\epsilon}.
+```
+
+The code does not replace all advantages by `mean(A)`. It pairs every
+`tilde A_i` with the same sample's `(observation_i, action_i)` and only then
+averages the resulting loss terms. For two samples, the gradient resembles
+
+```math
+-\frac12[\tilde A_1\nabla\log\pi(a_1\mid o_1)
++\tilde A_2\nabla\log\pi(a_2\mid o_2)],
+```
+
+not
+
+```math
+-\operatorname{mean}(\tilde A)
+\frac12[\nabla\log\pi(a_1\mid o_1)+\nabla\log\pi(a_2\mid o_2)].
+```
+
+Therefore the failed action remains identifiable during the update. A residual
+credit-assignment issue does remain at a deeper causal level: capacity failure
+is produced collectively, and the last agents to request a full shelter receive
+the explicit penalty even though earlier agents helped fill it. Parameter
+sharing can also make gradients from similar states partially cancel. The
+current method solves the direct *which stored transition failed?* problem, but
+not the complete counterfactual question of how responsibility should be
+distributed among all earlier capacity-consuming decisions.
