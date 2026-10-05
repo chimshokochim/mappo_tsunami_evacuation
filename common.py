@@ -16,7 +16,8 @@ EXCEL_FILE = 'Kochi_Shioe_evacuation_buildings.xlsx' # Shelter locations and cap
 BASE_SPEED   = 1.25   # mean of the per-agent 1.0--1.5 m/s free-flow range
 ROAD_WIDTH   = 5.0    # effective road width (m); used to compute pedestrian density
 REWARD_DEST  = 0.0    # the stable two-edge model has no terminal arrival bonus
-GAMMA        = 0.99   # discount factor (higher = rewards propagate further back in time)
+GAMMA        = 0.99   # PPO/GAE discount; terminal macro-transitions do not bootstrap
+TEAM_RETURN_GAMMA = 1.0  # no per-second discount in the team reward-to-go target
 # Overridable via MAPPO_TOTAL_EPISODES (same pattern as SEED above) so a
 # test run can extend training length without changing this default for
 # every other config. With ROLLOUT_EPISODES>1 in training.py, the actual

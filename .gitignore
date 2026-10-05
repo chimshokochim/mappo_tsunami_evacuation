@@ -1,2 +1,12 @@
 *.mp4
+*.pt
+*.pkl
+*.png
+*.pyc
 __pycache__/
+.pytest_cache/
+outputs*/
+_*smoke*/
+_*resume_equiv_*/
+source_backup_before_*/
+*_before_*.py

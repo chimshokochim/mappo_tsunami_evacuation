@@ -38,10 +38,10 @@ import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 
-PKL           = 'mappo_line_seed44_rollout4_lr1e4_entanneal_abs9000_noorthoinit_training_history.pkl'
+PKL           = 'mappo_line_seed44_rollout4_lr1e4_entanneal_abs9000_congestion10x_training_history.pkl'
 MA_WINDOW     = 800      # moving-average window, in episodes (entropy/actor_loss
                           # are only logged on update episodes -- see note below)
-OUTPUT_PNG    = 'actor_loss_decomposition_entanneal_abs9000.png'
+OUTPUT_PNG    = 'actor_loss_decomposition_entanneal_abs9000_congestion10x.png'
 
 
 def moving_avg(x, y, window):

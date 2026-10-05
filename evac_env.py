@@ -62,6 +62,8 @@ class EvacuationConfig:
     include_shelter_capacity_observation: bool = False
     shelter_capacity_mode: str = "hard_mask"
     observation_schema: str = "legacy"
+    include_total_demand_observation: bool = False
+    total_demand_observation_scale: int = 5000
 
 
 class EvacuationEnv:
@@ -91,6 +93,8 @@ class EvacuationEnv:
         c = self.config
         if c.num_agents <= 0:
             raise ValueError("num_agents must be positive")
+        if c.total_demand_observation_scale <= 0:
+            raise ValueError("total_demand_observation_scale must be positive")
         if c.shelter_capacity_mode not in ("hard_mask", "reject"):
             raise ValueError("shelter_capacity_mode must be 'hard_mask' or 'reject'")
         if c.observation_schema not in (
@@ -121,10 +125,33 @@ class EvacuationEnv:
                 "Every shelter-capacity combination must accommodate all agents"
             )
 
-    def reset(self, seed: Optional[int] = None) -> None:
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        episode_condition: Optional[tuple[int, int, int]] = None,
+    ) -> None:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         c = self.config
+        if episode_condition is None:
+            self.num_agents = c.num_agents
+            near_options = self._capacity_options(
+                c.near_shelter_capacity, c.near_shelter_capacity_candidates
+            )
+            near_capacity = int(self.rng.choice(near_options))
+            far_capacity = self._capacity_options(c.far_shelter_capacity, ())[0]
+        else:
+            self.num_agents, near_capacity, far_capacity = map(
+                int, episode_condition
+            )
+            if self.num_agents <= 0:
+                raise ValueError("Episode demand must be positive")
+            if near_capacity < 0 or far_capacity < 0:
+                raise ValueError("Episode shelter capacities must be non-negative")
+            if near_capacity + far_capacity < self.num_agents:
+                raise ValueError(
+                    "Episode shelter capacities must accommodate all agents"
+                )
         departure_steps = max(1, int(np.ceil(c.max_steps * c.departure_window_fraction)))
         self.episode_closure_edge = c.closure_edge
         self.episode_closure_start_step = c.closure_start_step
@@ -143,33 +170,79 @@ class EvacuationEnv:
             )
             self.episode_closure_capacity_fraction = 0.0
             self.episode_closure_speed_factor = 0.0
-        self.start_steps = self.rng.integers(0, departure_steps, c.num_agents)
-        near_options = self._capacity_options(
-            c.near_shelter_capacity, c.near_shelter_capacity_candidates
+        self.start_steps = self.rng.integers(
+            0, departure_steps, self.num_agents
         )
+        self._build_departure_schedule(departure_steps)
         self.episode_shelter_capacities = np.asarray(
-            [int(self.rng.choice(near_options)), self._capacity_options(c.far_shelter_capacity, ())[0]],
+            [near_capacity, far_capacity],
             dtype=np.int64,
         )
         self.shelter_reserved = np.zeros(2, dtype=np.int64)
         self.base_speeds = self.rng.uniform(
-            c.min_base_speed, c.max_base_speed, c.num_agents
+            c.min_base_speed, c.max_base_speed, self.num_agents
         ).astype(np.float32)
-        self.status = np.zeros(c.num_agents, dtype=np.int8)
-        self.capacity_rejected = np.zeros(c.num_agents, dtype=bool)
-        self.action = np.full(c.num_agents, -1, dtype=np.int8)
-        self.distance = np.zeros(c.num_agents, dtype=np.float32)
-        self.raw_returns = np.zeros(c.num_agents, dtype=np.float32)
-        self.discounted_returns = np.zeros(c.num_agents, dtype=np.float32)
-        self.discount_multiplier = np.ones(c.num_agents, dtype=np.float32)
+        self.status = np.zeros(self.num_agents, dtype=np.int8)
+        self.capacity_rejected = np.zeros(self.num_agents, dtype=bool)
+        self.action = np.full(self.num_agents, -1, dtype=np.int8)
+        self.distance = np.zeros(self.num_agents, dtype=np.float32)
+        self.raw_returns = np.zeros(self.num_agents, dtype=np.float32)
+        self.discounted_returns = np.zeros(self.num_agents, dtype=np.float32)
+        self.discount_multiplier = np.ones(self.num_agents, dtype=np.float32)
         # Mean reward across all agents at each environment step. This preserves
         # the reported system objective while allowing a global reward-to-go to
         # be assigned to every shelter-choice decision.
         self.team_step_rewards = np.zeros(c.max_steps, dtype=np.float32)
-        self.arrival_step = np.full(c.num_agents, np.nan, dtype=np.float32)
-        self.travel_time = np.full(c.num_agents, np.nan, dtype=np.float32)
+        self.arrival_step = np.full(self.num_agents, np.nan, dtype=np.float32)
+        self.travel_time = np.full(self.num_agents, np.nan, dtype=np.float32)
         self.previous_density = np.zeros(2, dtype=np.float32)
         self.current_step = 0
+
+        if c.observation_schema == "capacity_absolute_and_ratio":
+            observation_dim, state_dim = 7, 9
+        elif c.observation_schema == "capacity_ratio":
+            observation_dim, state_dim = 5, 7
+        else:
+            observation_dim = 3
+            if c.include_capacity_observation:
+                observation_dim += 2
+            if c.include_shelter_capacity_observation:
+                observation_dim += 2
+            state_dim = observation_dim
+        if c.include_total_demand_observation:
+            observation_dim += 1
+            state_dim += 1
+        # Reuse immutable empty batches after the departure window instead of
+        # rebuilding density/capacity features hundreds of times per episode.
+        self._empty_observations = np.empty(
+            (0, observation_dim), dtype=np.float32
+        )
+        self._empty_states = np.empty((0, state_dim), dtype=np.float32)
+
+    def _build_departure_schedule(self, departure_steps: Optional[int] = None) -> None:
+        """Cache agent IDs by departure step without changing their ID order.
+
+        Tests and diagnostic scripts that intentionally replace ``start_steps``
+        may call this method afterward to refresh the cache.
+        """
+        if departure_steps is None:
+            departure_steps = max(
+                1,
+                int(np.ceil(
+                    self.config.max_steps
+                    * self.config.departure_window_fraction
+                )),
+            )
+        # A stable sort preserves the ascending agent-ID order previously
+        # returned by np.flatnonzero for agents sharing a departure step.
+        departure_order = np.argsort(self.start_steps, kind="stable")
+        departure_counts = np.bincount(
+            self.start_steps, minlength=departure_steps
+        )
+        self.departures_by_step = tuple(
+            np.split(departure_order, np.cumsum(departure_counts)[:-1])
+        )
+        self._empty_agent_ids = np.empty(0, dtype=np.int64)
 
     def closure_active(self) -> bool:
         return (
@@ -197,7 +270,7 @@ class EvacuationEnv:
 
     def remaining_shelter_capacity_fractions(self) -> np.ndarray:
         """Remaining spaces normalized by total episode demand, not own capacity."""
-        return self.remaining_shelter_capacity().astype(np.float32) / self.config.num_agents
+        return self.remaining_shelter_capacity().astype(np.float32) / self.num_agents
 
     def remaining_shelter_capacity_ratios(self) -> np.ndarray:
         """Fraction of currently waiting demand each remaining capacity can hold."""
@@ -229,7 +302,7 @@ class EvacuationEnv:
         """Build observations for a specified set of currently departing agents."""
         ids = np.asarray(ids, dtype=np.int64)
         density = self.normalized_density()
-        waiting_fraction = np.count_nonzero(self.status == 0) / self.config.num_agents
+        waiting_fraction = np.count_nonzero(self.status == 0) / self.num_agents
         if self.config.observation_schema in (
             "capacity_ratio", "capacity_absolute_and_ratio"
         ):
@@ -237,7 +310,10 @@ class EvacuationEnv:
             include_absolute = (
                 self.config.observation_schema == "capacity_absolute_and_ratio"
             )
-            obs = np.empty((len(ids), 7 if include_absolute else 5), dtype=np.float32)
+            obs_base_dim = 7 if include_absolute else 5
+            state_base_dim = 9 if include_absolute else 7
+            extra_dim = int(self.config.include_total_demand_observation)
+            obs = np.empty((len(ids), obs_base_dim + extra_dim), dtype=np.float32)
             obs[:, :2] = density
             obs[:, 2] = waiting_fraction
             if include_absolute:
@@ -245,24 +321,35 @@ class EvacuationEnv:
                 obs[:, 5:7] = ratios
             else:
                 obs[:, 3:5] = ratios
-            state = np.empty((len(ids), 9 if include_absolute else 7), dtype=np.float32)
+            state = np.empty(
+                (len(ids), state_base_dim + extra_dim), dtype=np.float32
+            )
             state[:, :2] = density
             state[:, 2] = waiting_fraction
             state[:, 3] = np.count_nonzero(
                 (self.status == 1) | (self.status == 2)
-            ) / self.config.num_agents
-            state[:, 4] = np.count_nonzero(self.status == 4) / self.config.num_agents
+            ) / self.num_agents
+            state[:, 4] = np.count_nonzero(self.status == 4) / self.num_agents
             if include_absolute:
                 state[:, 5:7] = self.remaining_shelter_capacity_fractions()
                 state[:, 7:9] = ratios
             else:
                 state[:, 5:7] = ratios
+            if self.config.include_total_demand_observation:
+                normalized_demand = min(
+                    self.num_agents / self.config.total_demand_observation_scale,
+                    1.0,
+                )
+                obs[:, -1] = normalized_demand
+                state[:, -1] = normalized_demand
             return obs, state
         observation_dim = 3
         if self.config.include_capacity_observation:
             observation_dim += 2
         if self.config.include_shelter_capacity_observation:
             observation_dim += 2
+        if self.config.include_total_demand_observation:
+            observation_dim += 1
         obs = np.empty((len(ids), observation_dim), dtype=np.float32)
         obs[:, :2] = density
         # Include agents departing on this step: they are still waiting when the
@@ -270,7 +357,7 @@ class EvacuationEnv:
         obs[:, 2] = waiting_fraction
         state = np.empty((len(ids), observation_dim), dtype=np.float32)
         state[:, :2] = density
-        state[:, 2] = np.count_nonzero(self.status < 3) / self.config.num_agents
+        state[:, 2] = np.count_nonzero(self.status < 3) / self.num_agents
         if self.config.include_capacity_observation:
             availability = self.edge_availability()
             obs[:, 3:5] = availability
@@ -279,13 +366,26 @@ class EvacuationEnv:
             remaining = self.remaining_shelter_capacity_fractions()
             obs[:, 5:7] = remaining
             state[:, 5:7] = remaining
+        if self.config.include_total_demand_observation:
+            normalized_demand = min(
+                self.num_agents / self.config.total_demand_observation_scale,
+                1.0,
+            )
+            obs[:, -1] = normalized_demand
+            state[:, -1] = normalized_demand
         return obs, state
 
     def decision_batch(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return departing IDs, decentralized observations, and critic states."""
-        ids = np.flatnonzero(
-            (self.status == 0) & (self.start_steps == self.current_step)
-        )
+        if self.current_step >= len(self.departures_by_step):
+            return (
+                self._empty_agent_ids,
+                self._empty_observations,
+                self._empty_states,
+            )
+        ids = self.departures_by_step[self.current_step]
+        if len(ids) == 0:
+            return ids, self._empty_observations, self._empty_states
         obs, state = self.observations_for(ids)
         return ids, obs, state
 
@@ -340,7 +440,9 @@ class EvacuationEnv:
             excess /= 1.0 - c.free_density / c.max_density
             rewards = -c.congestion_penalty * np.minimum(excess, 1.0) - c.time_penalty
             active_ids = np.flatnonzero(active)
-            self.team_step_rewards[self.current_step] = rewards.sum() / c.num_agents
+            self.team_step_rewards[self.current_step] = (
+                rewards.sum() / self.num_agents
+            )
             self.raw_returns[active_ids] += rewards.astype(np.float32)
             self.discounted_returns[active_ids] += (
                 self.discount_multiplier[active_ids] * rewards
@@ -414,6 +516,7 @@ class EvacuationEnv:
             ),
             "mean_arrival_time_all_agents": float(timed_arrivals.mean()),
             "far_fraction": float(np.mean(self.action[chosen] == 1)) if np.any(chosen) else 0.0,
+            "num_agents": int(self.num_agents),
             "per_agent_arrival_times": self.travel_time.copy(),
             "per_agent_rewards": self.raw_returns.copy(),
             "near_shelter_capacity": int(self.episode_shelter_capacities[0]),

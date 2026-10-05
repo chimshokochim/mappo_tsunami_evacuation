@@ -14,8 +14,16 @@ from training import Actor, masked_probabilities
 
 def resolve_actor(path: Path) -> Path:
     if path.is_file():
-        if path.name != "actor.pt":
-            raise ValueError(f"Expected actor.pt, got: {path}")
+        valid_names = {
+            "actor.pt", "best_actor.pt", "best_joint_actor.pt",
+            "best_robust_joint_actor.pt",
+        }
+        if path.name not in valid_names:
+            raise ValueError(
+                "Expected actor.pt, best_actor.pt, best_joint_actor.pt, or "
+                "best_robust_joint_actor.pt, "
+                f"got: {path}"
+            )
         return path
     if not path.exists():
         raise FileNotFoundError(f"Path does not exist: {path}")
@@ -80,7 +88,12 @@ def run_evaluation_episode(
     probability_count = 0
     trace = {
         "physical_density_near": [],
+        "physical_density_far": [],
         "observed_density_near": [],
+        "observed_density_far": [],
+        "remaining_near_capacity": [],
+        "remaining_far_capacity": [],
+        "waiting_agents": [],
         "far_decisions": np.zeros(config.max_steps, dtype=np.int64),
         "far_probability_sum": np.zeros(config.max_steps, dtype=np.float64),
         "decision_count": np.zeros(config.max_steps, dtype=np.int64),
@@ -99,7 +112,13 @@ def run_evaluation_episode(
     while not env.finished():
         step = env.current_step
         ids, observations, _ = env.decision_batch()
-        trace["observed_density_near"].append(float(env.observed_density()[0]))
+        observed_density = env.observed_density()
+        remaining_capacity = env.remaining_shelter_capacity()
+        trace["observed_density_near"].append(float(observed_density[0]))
+        trace["observed_density_far"].append(float(observed_density[1]))
+        trace["remaining_near_capacity"].append(int(remaining_capacity[0]))
+        trace["remaining_far_capacity"].append(int(remaining_capacity[1]))
+        trace["waiting_agents"].append(int(np.count_nonzero(env.status == 0)))
         if len(ids):
             remaining = env.remaining_shelter_capacity()
             boundary_batch = np.any((remaining > 0) & (remaining < len(ids)))
@@ -170,6 +189,7 @@ def run_evaluation_episode(
                     )
         env.advance(gamma=0.99)
         trace["physical_density_near"].append(float(env.previous_density[0]))
+        trace["physical_density_far"].append(float(env.previous_density[1]))
     metrics = env.finalize()
     result = {
         "seed": seed,

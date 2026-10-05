@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--far-capacity", type=int, default=2400)
     parser.add_argument("--evaluation-seeds", type=int, nargs="+", default=list(range(300, 320)))
     parser.add_argument(
+        "--actor-filename", default="actor.pt",
+        choices=(
+            "actor.pt", "best_actor.pt", "best_joint_actor.pt",
+            "best_robust_joint_actor.pt",
+        ),
+        help="checkpoint filename loaded from each discovered run directory",
+    )
+    parser.add_argument(
         "--far-probabilities", type=float, nargs="+",
         default=list(DEFAULT_FAR_PROBABILITIES),
     )
@@ -113,7 +121,10 @@ def main() -> None:
     loaded = {}
     reference_config = None
     for seed, run_dir in run_dirs.items():
-        actor, config, actor_path = load_actor_and_config(run_dir)
+        actor_path = run_dir / args.actor_filename
+        if not actor_path.is_file():
+            raise FileNotFoundError(f"Missing {args.actor_filename}: {run_dir}")
+        actor, config, actor_path = load_actor_and_config(actor_path)
         if reference_config is None:
             reference_config = config
         elif (
@@ -134,6 +145,7 @@ def main() -> None:
         "near_capacities": args.near_capacities,
         "far_capacity": args.far_capacity,
         "far_probabilities": args.far_probabilities,
+        "actor_filename": args.actor_filename,
     }
     result = {
         **run_signature,

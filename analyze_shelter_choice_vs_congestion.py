@@ -42,7 +42,7 @@ from common import (SEED, build_line_graph, make_line_evac_data,
 from evac_env import EvacuationEnv
 
 # ── Config (mirrors training.py's USE_LINE_MAP block) ──────────────────────────
-ACTOR_PATH   = 'mappo_line_seed44_rollout4_16000ep_actor.pt'
+ACTOR_PATH   = 'mappo_lineseed44_rollout4_lr1e4_entanneal_abs9000_congestion_fracwaiting_mcreturns_artcong_mix_actor.pt'
 HIDDEN_SIZE  = 64
 
 LINE_DIST_NEAR         = 150.0
@@ -56,7 +56,7 @@ NEAREST_SHELTER_TARGET   = True
 N_EPISODES = 10   # more episodes = more decision points = smoother scatter/correlation
 BASE_SEED  = SEED
 
-OUTPUT_PNG = 'shelter_choice_vs_congestion_rollout4_16000ep_baseline.png'
+OUTPUT_PNG = 'shelter_choice_vs_congestion_seed44_rollout4_lr1e4_entanneal_abs9000_congestion_fracwaiting_mcreturns_artcong_mix.png'
 
 
 class Actor(nn.Module):
