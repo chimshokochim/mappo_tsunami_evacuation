@@ -75,6 +75,23 @@ class Critic(nn.Module):
         return self.network(state).squeeze(-1)
 
 
+class CostCritic(nn.Module):
+    """Centralized value estimates for the shared policy's cost constraints."""
+
+    def __init__(self, input_dim: int, num_costs: int) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.num_costs = num_costs
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, HIDDEN_SIZE), nn.Tanh(),
+            nn.Linear(HIDDEN_SIZE, HIDDEN_SIZE), nn.Tanh(),
+            nn.Linear(HIDDEN_SIZE, num_costs),
+        )
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.network(state)
+
+
 @dataclass
 class PPOConfig:
     observation_dim: int = 5
@@ -96,6 +113,13 @@ class PPOConfig:
     entropy_anneal_episodes: int = ENTROPY_ANNEAL_EPISODES
     advantage_epsilon: float = ADVANTAGE_EPSILON
     advantage_reward: str = "team_mean_reward_to_go"
+    constraint_mode: str = "none"
+    num_costs: int = 1
+    cost_critic_learning_rate: float = LR_CRITIC
+    cost_limits: tuple[float, ...] = (0.0,)
+    lagrange_learning_rates: tuple[float, ...] = (0.01,)
+    lagrange_initial_values: tuple[float, ...] = (0.0,)
+    lagrange_max: float = 100.0
 
 
 def compute_gae(
@@ -151,6 +175,45 @@ class MAPPOAgent:
         self.optimizer_critic = torch.optim.Adam(
             self.critic.parameters(), lr=config.critic_learning_rate
         )
+        if config.constraint_mode not in ("none", "lagrangian"):
+            raise ValueError(
+                f"Unknown constraint mode: {config.constraint_mode}"
+            )
+        if config.num_costs <= 0:
+            raise ValueError("num_costs must be positive")
+        for name, values in (
+            ("cost_limits", config.cost_limits),
+            ("lagrange_learning_rates", config.lagrange_learning_rates),
+            ("lagrange_initial_values", config.lagrange_initial_values),
+        ):
+            if len(values) != config.num_costs:
+                raise ValueError(
+                    f"{name} must contain {config.num_costs} value(s), "
+                    f"got {len(values)}"
+                )
+        if config.lagrange_max <= 0.0:
+            raise ValueError("lagrange_max must be positive")
+        if any(value < 0.0 for value in config.lagrange_learning_rates):
+            raise ValueError("lagrange learning rates must be non-negative")
+        if any(value < 0.0 for value in config.lagrange_initial_values):
+            raise ValueError("initial Lagrange multipliers must be non-negative")
+
+        self.cost_critic: CostCritic | None = None
+        self.optimizer_cost_critic: torch.optim.Optimizer | None = None
+        self.lagrange_multipliers: torch.Tensor | None = None
+        if config.constraint_mode == "lagrangian":
+            self.cost_critic = CostCritic(
+                config.critic_state_dim, config.num_costs
+            ).to(device)
+            self.optimizer_cost_critic = torch.optim.Adam(
+                self.cost_critic.parameters(),
+                lr=config.cost_critic_learning_rate,
+            )
+            self.lagrange_multipliers = torch.as_tensor(
+                config.lagrange_initial_values,
+                dtype=torch.float32,
+                device=device,
+            )
         self.update_count = 0
 
     @torch.no_grad()
@@ -185,25 +248,64 @@ class MAPPOAgent:
         action_masks = torch.as_tensor(
             batch["action_masks"], dtype=torch.float32, device=self.device
         ).detach()
+        cost_returns = None
+        if c.constraint_mode == "lagrangian":
+            if "cost_returns" not in batch:
+                raise KeyError(
+                    "Lagrangian PPO requires cost_returns in the rollout batch"
+                )
+            cost_returns = torch.as_tensor(
+                batch["cost_returns"], dtype=torch.float32, device=self.device
+            ).detach()
+            if cost_returns.ndim != 2 or cost_returns.shape != (
+                len(actions), c.num_costs
+            ):
+                raise ValueError(
+                    "cost_returns must have shape "
+                    f"({len(actions)}, {c.num_costs}), got "
+                    f"{tuple(cost_returns.shape)}"
+                )
         for name, value in (("observations", obs), ("states", states),
                             ("old_log_probability", old_log_probs), ("return", returns),
                             ("action mask", action_masks)):
             _require_finite(name, value)
+        if cost_returns is not None:
+            _require_finite("cost return", cost_returns)
         size = len(actions)
         if size == 0:
             raise ValueError("Cannot update PPO from an empty rollout")
         with torch.no_grad():
-            advantages = (returns - self.critic(states)).detach()
-            _require_finite("advantage before normalization", advantages)
-            advantages = (advantages - advantages.mean()) / (
-                advantages.std(unbiased=False) + c.advantage_epsilon
+            reward_advantages = (returns - self.critic(states)).detach()
+            _require_finite(
+                "advantage before normalization", reward_advantages
             )
-            _require_finite("normalized advantage", advantages)
+            reward_advantages = (
+                reward_advantages - reward_advantages.mean()
+            ) / (
+                reward_advantages.std(unbiased=False) + c.advantage_epsilon
+            )
+            _require_finite("normalized advantage", reward_advantages)
+
+            cost_advantages = None
+            advantages = reward_advantages
+            if c.constraint_mode == "lagrangian":
+                if self.cost_critic is None or self.lagrange_multipliers is None:
+                    raise RuntimeError("Lagrangian components are not initialized")
+                cost_advantages = (
+                    cost_returns - self.cost_critic(states)
+                ).detach()
+                _require_finite("cost advantage", cost_advantages)
+                advantages = reward_advantages - (
+                    cost_advantages * self.lagrange_multipliers
+                ).sum(dim=-1)
+                _require_finite("Lagrangian advantage", advantages)
 
         sums = {key: 0.0 for key in (
             "actor_loss", "critic_loss", "policy_entropy", "mean_prob_near",
             "mean_prob_far", "approx_kl", "clip_fraction"
         )}
+        if c.constraint_mode == "lagrangian":
+            sums["cost_critic_loss"] = 0.0
         sample_count = 0
         for _ in range(c.ppo_epochs):
             # One permutation per epoch means no duplicate or missing samples.
@@ -238,6 +340,31 @@ class MAPPOAgent:
                 nn.utils.clip_grad_norm_(self.critic.parameters(), c.max_grad_norm)
                 self.optimizer_critic.step()
 
+                cost_critic_loss = None
+                if c.constraint_mode == "lagrangian":
+                    if (
+                        self.cost_critic is None
+                        or self.optimizer_cost_critic is None
+                        or cost_returns is None
+                    ):
+                        raise RuntimeError(
+                            "Lagrangian components are not initialized"
+                        )
+                    predicted_cost_values = self.cost_critic(states[ids])
+                    cost_critic_loss = 0.5 * (
+                        predicted_cost_values - cost_returns[ids]
+                    ).pow(2).mean()
+                    _require_finite(
+                        "cost critic prediction", predicted_cost_values
+                    )
+                    _require_finite("cost critic loss", cost_critic_loss)
+                    self.optimizer_cost_critic.zero_grad(set_to_none=True)
+                    cost_critic_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        self.cost_critic.parameters(), c.max_grad_norm
+                    )
+                    self.optimizer_cost_critic.step()
+
                 n = len(ids)
                 with torch.no_grad():
                     approx_kl = (old_log_probs[ids] - new_log_probs).mean()
@@ -251,6 +378,8 @@ class MAPPOAgent:
                         "mean_prob_far": probabilities[:, 1].mean(),
                         "approx_kl": approx_kl, "clip_fraction": clip_fraction,
                     }
+                    if cost_critic_loss is not None:
+                        values["cost_critic_loss"] = cost_critic_loss
                     for key, value in values.items():
                         sums[key] += float(value.item()) * n
                 sample_count += n
@@ -263,6 +392,43 @@ class MAPPOAgent:
             "transition_count": size,
             "update": self.update_count,
         })
+        if c.constraint_mode == "lagrangian":
+            if (
+                cost_returns is None
+                or cost_advantages is None
+                or self.lagrange_multipliers is None
+            ):
+                raise RuntimeError("Lagrangian components are not initialized")
+            with torch.no_grad():
+                observed_costs = cost_returns.mean(dim=0)
+                cost_limits = torch.as_tensor(
+                    c.cost_limits, dtype=torch.float32, device=self.device
+                )
+                lagrange_learning_rates = torch.as_tensor(
+                    c.lagrange_learning_rates,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                violations = observed_costs - cost_limits
+                self.lagrange_multipliers.add_(
+                    lagrange_learning_rates * violations
+                ).clamp_(min=0.0, max=c.lagrange_max)
+                result["mean_lagrangian_advantage"] = float(
+                    advantages.mean().item()
+                )
+                for cost_index in range(c.num_costs):
+                    result[f"observed_cost_{cost_index}"] = float(
+                        observed_costs[cost_index].item()
+                    )
+                    result[f"constraint_violation_{cost_index}"] = float(
+                        violations[cost_index].item()
+                    )
+                    result[f"lagrange_multiplier_{cost_index}"] = float(
+                        self.lagrange_multipliers[cost_index].item()
+                    )
+                    result[f"mean_cost_advantage_{cost_index}"] = float(
+                        cost_advantages[:, cost_index].mean().item()
+                    )
         for name, value in result.items():
             _require_finite(name, value)
         return result
@@ -508,10 +674,53 @@ def parse_args() -> argparse.Namespace:
             "absolute-and-demand-ratio: Actor 7/Critic 9)"
         ),
     )
+    parser.add_argument(
+        "--constraint-mode", choices=("none", "lagrangian"), default="none",
+        help=(
+            "none preserves the existing PPO objective; lagrangian separates "
+            "failure costs from reward and learns shared multipliers"
+        ),
+    )
+    parser.add_argument(
+        "--num-costs", type=int, default=1,
+        help="number of shared cost constraints (the environment currently supplies one)",
+    )
+    parser.add_argument(
+        "--cost-critic-learning-rate", type=float, default=LR_CRITIC,
+    )
+    parser.add_argument(
+        "--cost-limits", type=float, nargs="+", default=[0.0],
+        help="one value per cost, or one value broadcast to every cost",
+    )
+    parser.add_argument(
+        "--lagrange-learning-rates", type=float, nargs="+", default=[0.01],
+        help="one multiplier step size per cost, or one value broadcast to every cost",
+    )
+    parser.add_argument(
+        "--lagrange-initial-values", type=float, nargs="+", default=[0.0],
+        help="one initial non-negative multiplier per cost, or one broadcast value",
+    )
+    parser.add_argument("--lagrange-max", type=float, default=100.0)
     return parser.parse_args()
 
 
 EpisodeCondition = tuple[int, int, int]
+
+
+def _expand_constraint_values(
+    values: Sequence[float], num_costs: int, name: str
+) -> tuple[float, ...]:
+    """Broadcast a scalar CLI setting or validate one value per cost."""
+    if num_costs <= 0:
+        raise ValueError("--num-costs must be positive")
+    result = tuple(float(value) for value in values)
+    if len(result) == 1:
+        return result * num_costs
+    if len(result) != num_costs:
+        raise ValueError(
+            f"{name} requires one value or {num_costs} values, got {len(result)}"
+        )
+    return result
 
 
 def build_mixed_demand_conditions(
@@ -734,6 +943,19 @@ def _checkpoint_payload(
         "critic_state_dict": mappo_brain.critic.state_dict(),
         "actor_optimizer_state_dict": mappo_brain.optimizer_actor.state_dict(),
         "critic_optimizer_state_dict": mappo_brain.optimizer_critic.state_dict(),
+        "constraint_mode": mappo_brain.config.constraint_mode,
+        "cost_critic_state_dict": (
+            mappo_brain.cost_critic.state_dict()
+            if mappo_brain.cost_critic is not None else None
+        ),
+        "cost_critic_optimizer_state_dict": (
+            mappo_brain.optimizer_cost_critic.state_dict()
+            if mappo_brain.optimizer_cost_critic is not None else None
+        ),
+        "lagrange_multipliers": (
+            mappo_brain.lagrange_multipliers.detach().cpu().clone()
+            if mappo_brain.lagrange_multipliers is not None else None
+        ),
         "update_count": mappo_brain.update_count,
         "environment_rng_state": env.rng.bit_generator.state,
         "python_rng_state": random.getstate(),
@@ -802,14 +1024,26 @@ def collect_episode(
     team_reward_to_go = env.team_discounted_reward_to_go(
         mappo_brain.config.team_return_gamma
     )
+    failed = np.asarray(
+        metrics["per_agent_failed"], dtype=np.float32
+    )[ids][order]
     # The failure term is an episode outcome and is added without another gamma
     # discount. At step 900, gamma**900 would otherwise make it nearly invisible
     # to the one-shot decisions made near the beginning of the episode.
-    if env.config.shelter_capacity_mode == "reject":
+    cost_returns = None
+    if mappo_brain.config.constraint_mode == "lagrangian":
+        if mappo_brain.config.num_costs != 1:
+            raise RuntimeError(
+                "collect_episode currently exposes one per-agent failure cost"
+            )
+        # Reward represents evacuation efficiency. Safety is a separate,
+        # non-negative cost so the same failure is not penalized twice.
+        discounted_return = team_reward_to_go[decision_steps]
+        cost_returns = failed[:, None]
+    elif env.config.shelter_capacity_mode == "reject":
         # A rejected/timeout decision receives its own failure penalty. Averaged
         # across agents this is the same -penalty * failure_fraction objective,
         # but direct attribution gives the one-shot Actor a useful learning signal.
-        failed = np.asarray(metrics["per_agent_failed"], dtype=np.float32)[ids][order]
         discounted_return = (
             team_reward_to_go[decision_steps]
             + env.config.failure_penalty * failed
@@ -838,6 +1072,8 @@ def collect_episode(
         "log_probs": old_log_prob,
         "returns": return_targets,
     }
+    if cost_returns is not None:
+        batch["cost_returns"] = cost_returns
     metrics["sampled_far_fraction"] = metrics.pop("far_fraction")
     metrics["mean_prob_near"] = float(probs[:, 0].mean())
     metrics["mean_prob_far"] = float(probs[:, 1].mean())
@@ -845,6 +1081,10 @@ def collect_episode(
     # The mappo_brain uses a team reward-to-go target, which is distinct from the
     # raw per-agent episode return reported by the environment.
     metrics["mean_training_return_target"] = float(np.mean(return_targets))
+    metrics["mean_efficiency_return_per_agent"] = float(
+        metrics["mean_agent_reward"] - metrics["team_failure_penalty"]
+    )
+    metrics["observed_cost_0"] = float(failed.mean())
     # Stable diagnostics names matching the reported quantities.
     metrics["mean_episode_return_per_agent"] = metrics["mean_agent_reward"]
     metrics["arrived_only_mean_arrival_time"] = metrics["mean_arrival_time_arrived_only"]
@@ -1214,6 +1454,24 @@ def main() -> None:
     if mixed_demand:
         actor_input_dim += 1
         critic_input_dim += 1
+    if args.constraint_mode == "lagrangian" and args.num_costs != 1:
+        raise ValueError(
+            "The current environment exposes one cost (per-agent failure). "
+            "Add further per-agent cost columns before using --num-costs > 1."
+        )
+    cost_limits = _expand_constraint_values(
+        args.cost_limits, args.num_costs, "--cost-limits"
+    )
+    lagrange_learning_rates = _expand_constraint_values(
+        args.lagrange_learning_rates,
+        args.num_costs,
+        "--lagrange-learning-rates",
+    )
+    lagrange_initial_values = _expand_constraint_values(
+        args.lagrange_initial_values,
+        args.num_costs,
+        "--lagrange-initial-values",
+    )
     ppo_config = PPOConfig(
         team_return_gamma=args.team_return_gamma,
         entropy_mode=args.entropy_mode,
@@ -1224,6 +1482,13 @@ def main() -> None:
         minibatch_size=args.minibatch_size,
         observation_dim=actor_input_dim,
         critic_state_dim=critic_input_dim,
+        constraint_mode=args.constraint_mode,
+        num_costs=args.num_costs,
+        cost_critic_learning_rate=args.cost_critic_learning_rate,
+        cost_limits=cost_limits,
+        lagrange_learning_rates=lagrange_learning_rates,
+        lagrange_initial_values=lagrange_initial_values,
+        lagrange_max=args.lagrange_max,
     )
     env = EvacuationEnv(env_config, seed=args.seed)
     mappo_brain = MAPPOAgent(ppo_config, device)
@@ -1238,7 +1503,8 @@ def main() -> None:
         "mean_episode_return_per_agent", "arrived_only_mean_arrival_time",
         "mean_arrival_time_with_timeouts", "arrived_count", "total_count", "failure_count",
         "sampled_far_fraction", "mean_prob_near", "mean_prob_far", "policy_entropy",
-        "mean_training_return_target",
+        "mean_training_return_target", "mean_efficiency_return_per_agent",
+        "observed_cost_0",
         "near_shelter_capacity", "far_shelter_capacity",
         "near_reserved_count", "far_reserved_count", "team_failure_penalty",
         "capacity_rejection_count", "timeout_count",
@@ -1250,6 +1516,17 @@ def main() -> None:
         "mean_prob_near", "mean_prob_far", "sampled_far_fraction", "approx_kl",
         "clip_fraction", "transition_count",
     )
+    if ppo_config.constraint_mode == "lagrangian":
+        update_keys += (
+            "cost_critic_loss", "mean_lagrangian_advantage",
+        )
+        for cost_index in range(ppo_config.num_costs):
+            update_keys += (
+                f"observed_cost_{cost_index}",
+                f"constraint_violation_{cost_index}",
+                f"lagrange_multiplier_{cost_index}",
+                f"mean_cost_advantage_{cost_index}",
+            )
     diagnostics = {
         "environment_config": asdict(env_config),
         "ppo_config": asdict(ppo_config),
@@ -1321,6 +1598,48 @@ def main() -> None:
         mappo_brain.optimizer_critic.load_state_dict(
             checkpoint["critic_optimizer_state_dict"]
         )
+        checkpoint_constraint_mode = checkpoint.get(
+            "constraint_mode", "none"
+        )
+        if checkpoint_constraint_mode != ppo_config.constraint_mode:
+            raise ValueError(
+                "Cannot exactly resume a checkpoint with constraint_mode="
+                f"{checkpoint_constraint_mode!r} using "
+                f"constraint_mode={ppo_config.constraint_mode!r}"
+            )
+        if ppo_config.constraint_mode == "lagrangian":
+            required = (
+                "cost_critic_state_dict",
+                "cost_critic_optimizer_state_dict",
+                "lagrange_multipliers",
+            )
+            missing = [name for name in required if checkpoint.get(name) is None]
+            if missing:
+                raise ValueError(
+                    "Lagrangian checkpoint is missing: " + ", ".join(missing)
+                )
+            if (
+                mappo_brain.cost_critic is None
+                or mappo_brain.optimizer_cost_critic is None
+                or mappo_brain.lagrange_multipliers is None
+            ):
+                raise RuntimeError("Lagrangian components are not initialized")
+            mappo_brain.cost_critic.load_state_dict(
+                checkpoint["cost_critic_state_dict"]
+            )
+            mappo_brain.optimizer_cost_critic.load_state_dict(
+                checkpoint["cost_critic_optimizer_state_dict"]
+            )
+            saved_multipliers = torch.as_tensor(
+                checkpoint["lagrange_multipliers"],
+                dtype=torch.float32,
+                device=device,
+            )
+            if saved_multipliers.shape != mappo_brain.lagrange_multipliers.shape:
+                raise ValueError(
+                    "Checkpoint Lagrange multiplier shape does not match config"
+                )
+            mappo_brain.lagrange_multipliers.copy_(saved_multipliers)
         mappo_brain.update_count = int(checkpoint["update_count"])
         env.rng.bit_generator.state = checkpoint["environment_rng_state"]
         random.setstate(checkpoint["python_rng_state"])
@@ -1894,6 +2213,24 @@ def main() -> None:
                 f"blockage_episodes={blockage_episodes}/{ppo_config.rollout_episodes}",
                 flush=True,
             )
+            if ppo_config.constraint_mode == "lagrangian":
+                constraint_parts = [
+                    f"cost_critic_loss={update_metrics['cost_critic_loss']:.4f}",
+                    (
+                        "lagrangian_adv="
+                        f"{update_metrics['mean_lagrangian_advantage']:.4f}"
+                    ),
+                ]
+                for cost_index in range(ppo_config.num_costs):
+                    constraint_parts.extend((
+                        f"cost_{cost_index}="
+                        f"{update_metrics[f'observed_cost_{cost_index}']:.6f}",
+                        f"violation_{cost_index}="
+                        f"{update_metrics[f'constraint_violation_{cost_index}']:.6f}",
+                        f"lambda_{cost_index}="
+                        f"{update_metrics[f'lagrange_multiplier_{cost_index}']:.6f}",
+                    ))
+                print("constraint " + " ".join(constraint_parts), flush=True)
             if args.profile_runtime:
                 print(
                     f"runtime rollout_{ppo_config.rollout_episodes}ep="
@@ -1965,6 +2302,10 @@ def main() -> None:
             run_dir / "latest_checkpoint.pt",
         )
     torch.save(mappo_brain.critic.state_dict(), run_dir / "critic.pt")
+    if mappo_brain.cost_critic is not None:
+        torch.save(
+            mappo_brain.cost_critic.state_dict(), run_dir / "cost_critic.pt"
+        )
     with (run_dir / "diagnostics.pkl").open("wb") as handle:
         pickle.dump(diagnostics, handle, protocol=pickle.HIGHEST_PROTOCOL)
     (run_dir / "environment_config.json").write_text(
@@ -1982,6 +2323,13 @@ def main() -> None:
             "entropy_end": args.entropy_end,
             "entropy_anneal_episodes": args.entropy_anneal_episodes,
             "team_return_gamma": args.team_return_gamma,
+            "constraint_mode": args.constraint_mode,
+            "num_costs": args.num_costs,
+            "cost_critic_learning_rate": args.cost_critic_learning_rate,
+            "cost_limits": list(cost_limits),
+            "lagrange_learning_rates": list(lagrange_learning_rates),
+            "lagrange_initial_values": list(lagrange_initial_values),
+            "lagrange_max": args.lagrange_max,
             "capacity_mode": args.capacity_mode,
             "capacity_observation": selected_capacity_observation,
             "num_agent_candidates": args.num_agent_candidates,
