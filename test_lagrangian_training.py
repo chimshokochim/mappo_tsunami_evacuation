@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from training import MAPPOAgent, PPOConfig
+from training import MAPPOAgent, PPOConfig, _safe_model_key
 
 
 def _synthetic_batch(size: int, obs_dim: int, state_dim: int, num_costs: int):
@@ -23,6 +23,22 @@ def _synthetic_batch(size: int, obs_dim: int, state_dim: int, num_costs: int):
 
 
 def main() -> None:
+    faster_lower_return = {
+        "max_failure_count": 0,
+        "failure_count": 0.0,
+        "mean_arrival_time_with_timeouts": 300.0,
+        "mean_episode_return_per_agent": -999.0,
+    }
+    slower_higher_return = {
+        "max_failure_count": 0,
+        "failure_count": 0.0,
+        "mean_arrival_time_with_timeouts": 320.0,
+        "mean_episode_return_per_agent": 999.0,
+    }
+    assert _safe_model_key(faster_lower_return) < _safe_model_key(
+        slower_higher_return
+    )
+
     torch.manual_seed(3)
     baseline = MAPPOAgent(PPOConfig(), torch.device("cpu"))
     assert baseline.cost_critic is None

@@ -593,13 +593,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-min-episode", type=int, default=4000)
     parser.add_argument(
         "--early-stop-window", type=int, default=500,
-        help="size of each of the previous/recent training windows",
+        help="legacy option retained for CLI compatibility; no longer used",
     )
     parser.add_argument(
         "--early-stop-return-tolerance", type=float, default=0.5,
+        help="legacy option retained for CLI compatibility; no longer used",
     )
     parser.add_argument(
         "--early-stop-arrival-tolerance", type=float, default=2.0,
+        help="legacy option retained for CLI compatibility; no longer used",
     )
     parser.add_argument(
         "--early-stop-patience", type=int, default=3,
@@ -610,11 +612,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--early-stop-return-improvement", type=float, default=0.1,
-        help="validation return increase that resets plateau patience",
+        help="legacy option retained for CLI compatibility; no longer used",
     )
     parser.add_argument(
         "--early-stop-arrival-improvement", type=float, default=0.5,
-        help="validation arrival-time decrease that resets plateau patience",
+        help=(
+            "minimum safe-validation arrival-time decrease that resets "
+            "the safety-first plateau counter"
+        ),
     )
     parser.add_argument(
         "--common-checkpoint-episode", type=int, default=4000,
@@ -1245,6 +1250,15 @@ def _training_stability(
     }
 
 
+def _safe_model_key(validation: dict) -> tuple[int, float, float]:
+    """Rank checkpoints lexicographically by safety, then evacuation time."""
+    return (
+        int(validation["max_failure_count"]),
+        float(validation["failure_count"]),
+        float(validation["mean_arrival_time_with_timeouts"]),
+    )
+
+
 def main() -> None:
     args = parse_args()
     if args.episodes <= 0:
@@ -1555,22 +1569,17 @@ def main() -> None:
         "early_stopping": {
             "enabled": bool(args.early_stopping),
             "min_episode": int(args.early_stop_min_episode),
-            "window": int(args.early_stop_window),
-            "return_tolerance": float(args.early_stop_return_tolerance),
-            "arrival_tolerance": float(args.early_stop_arrival_tolerance),
             "patience": int(args.early_stop_patience),
             "min_validation_seeds": int(
                 args.early_stop_min_validation_seeds
             ),
-            "return_improvement": float(
-                args.early_stop_return_improvement
-            ),
             "arrival_improvement": float(
                 args.early_stop_arrival_improvement
             ),
-            "plateau_checks": 0,
-            "best_eligible_return": None,
-            "best_eligible_arrival": None,
+            "safe_validation_streak": 0,
+            "arrival_plateau_checks": 0,
+            "best_safe_arrival": None,
+            "previous_validation_lagrange": None,
             "checks": [],
             "stopped": False,
             "stop_episode": None,
@@ -1656,6 +1665,21 @@ def main() -> None:
             "best_episode": None,
             "checks": [],
         })
+        existing_validations = diagnostics.get("validation", [])
+        if existing_validations:
+            migrated_best = min(existing_validations, key=_safe_model_key)
+            safe_state = diagnostics["safe_model_selection"]
+            safe_state["best_key"] = list(_safe_model_key(migrated_best))
+            safe_state["best_episode"] = int(migrated_best["episode"])
+            safe_state["checks"] = [
+                {
+                    "episode": int(item["episode"]),
+                    "safe_key": list(_safe_model_key(item)),
+                    "is_best": int(item["episode"])
+                    == int(migrated_best["episode"]),
+                }
+                for item in existing_validations
+            ]
         start_episode = int(checkpoint["episode_completed"])
         best_validation_return = float(
             checkpoint.get("best_validation_return", -float("inf"))
@@ -1687,17 +1711,18 @@ def main() -> None:
     early_stop_state.update({
         "enabled": bool(args.early_stopping),
         "min_episode": int(args.early_stop_min_episode),
-        "window": int(args.early_stop_window),
-        "return_tolerance": float(args.early_stop_return_tolerance),
-        "arrival_tolerance": float(args.early_stop_arrival_tolerance),
         "patience": int(args.early_stop_patience),
         "min_validation_seeds": int(args.early_stop_min_validation_seeds),
-        "return_improvement": float(args.early_stop_return_improvement),
         "arrival_improvement": float(args.early_stop_arrival_improvement),
     })
-    early_stop_state.setdefault("plateau_checks", 0)
-    early_stop_state.setdefault("best_eligible_return", None)
-    early_stop_state.setdefault("best_eligible_arrival", None)
+    if "safe_validation_streak" not in early_stop_state:
+        if early_stop_state.get("checks"):
+            early_stop_state["legacy_checks"] = early_stop_state["checks"]
+        early_stop_state["checks"] = []
+    early_stop_state.setdefault("safe_validation_streak", 0)
+    early_stop_state.setdefault("arrival_plateau_checks", 0)
+    early_stop_state.setdefault("best_safe_arrival", None)
+    early_stop_state.setdefault("previous_validation_lagrange", None)
     early_stop_state.setdefault("checks", [])
     # A resumed run is a new opportunity to satisfy the same predeclared rule.
     early_stop_state["stopped"] = False
@@ -1968,15 +1993,10 @@ def main() -> None:
             validation["robust_joint_eligible"] = robust_joint_eligible
             validation["robust_joint_is_best"] = robust_joint_is_best
 
-            # Safety-first checkpoint selection across every validation episode:
-            # minimize worst-condition/seed failures, then mean failures, then
-            # maximize return, and finally minimize all-agent arrival time.
-            safe_key = (
-                int(validation["max_failure_count"]),
-                float(validation["failure_count"]),
-                -float(validation["mean_episode_return_per_agent"]),
-                float(validation["mean_arrival_time_with_timeouts"]),
-            )
+            # Lexicographic safety-first selection: minimize the worst observed
+            # failure count, then mean failures, then all-agent arrival time.
+            # Return remains a training diagnostic but does not decide the winner.
+            safe_key = _safe_model_key(validation)
             safe_state = diagnostics["safe_model_selection"]
             previous_safe_key = safe_state.get("best_key")
             safe_is_best = (
@@ -1999,77 +2019,88 @@ def main() -> None:
                 )
 
             if args.early_stopping:
-                best_eligible_return = early_stop_state[
-                    "best_eligible_return"
-                ]
-                best_eligible_arrival = early_stop_state[
-                    "best_eligible_arrival"
-                ]
-                material_improvement = False
-                if robust_joint_eligible:
-                    material_improvement = (
-                        best_eligible_return is None
-                        or best_eligible_arrival is None
-                        or validation["mean_episode_return_per_agent"]
-                        > best_eligible_return
-                        + args.early_stop_return_improvement
-                        or validation["mean_arrival_time_with_timeouts"]
-                        < best_eligible_arrival
+                validation_safe = validation["max_failure_count"] == 0
+                current_arrival = float(
+                    validation["mean_arrival_time_with_timeouts"]
+                )
+                best_safe_arrival = early_stop_state["best_safe_arrival"]
+                arrival_improved = False
+                if validation_safe:
+                    early_stop_state["safe_validation_streak"] += 1
+                    arrival_improved = (
+                        best_safe_arrival is None
+                        or current_arrival
+                        < best_safe_arrival
                         - args.early_stop_arrival_improvement
                     )
-                    early_stop_state["best_eligible_return"] = max(
-                        validation["mean_episode_return_per_agent"],
-                        best_eligible_return
-                        if best_eligible_return is not None
-                        else -float("inf"),
-                    )
-                    early_stop_state["best_eligible_arrival"] = min(
-                        validation["mean_arrival_time_with_timeouts"],
-                        best_eligible_arrival
-                        if best_eligible_arrival is not None
-                        else float("inf"),
-                    )
-                robust_checkpoint_available = (
-                    robust_joint_is_best
-                    or (run_dir / "best_robust_joint_actor.pt").exists()
+                    if arrival_improved:
+                        early_stop_state["best_safe_arrival"] = current_arrival
+                        early_stop_state["arrival_plateau_checks"] = 0
+                    else:
+                        early_stop_state["arrival_plateau_checks"] += 1
+                else:
+                    early_stop_state["safe_validation_streak"] = 0
+                    early_stop_state["arrival_plateau_checks"] = 0
+
+                recent_kl = np.asarray(
+                    diagnostics["update_metrics"]["approx_kl"]
+                    [-args.validation_every_updates:],
+                    dtype=float,
                 )
+                mean_absolute_kl = float(np.mean(np.abs(recent_kl)))
+                kl_stable = mean_absolute_kl <= 0.01
+
+                current_lagrange = (
+                    mappo_brain.lagrange_multipliers.detach().cpu().tolist()
+                    if mappo_brain.lagrange_multipliers is not None else []
+                )
+                previous_lagrange = early_stop_state[
+                    "previous_validation_lagrange"
+                ]
+                if previous_lagrange is None or not current_lagrange:
+                    max_lagrange_increase = 0.0
+                else:
+                    max_lagrange_increase = max(
+                        current - previous
+                        for current, previous in zip(
+                            current_lagrange, previous_lagrange
+                        )
+                    )
+                early_stop_state["previous_validation_lagrange"] = (
+                    current_lagrange
+                )
+                lagrange_not_surging = max_lagrange_increase <= 0.05
+
                 minimum_reached = (
                     completed_episode >= args.early_stop_min_episode
                 )
-                if not minimum_reached or material_improvement:
-                    early_stop_state["plateau_checks"] = 0
-                elif robust_checkpoint_available:
-                    early_stop_state["plateau_checks"] += 1
-                else:
-                    early_stop_state["plateau_checks"] = 0
-
-                stability = _training_stability(
-                    diagnostics,
-                    args.early_stop_window,
-                    args.early_stop_return_tolerance,
-                    args.early_stop_arrival_tolerance,
-                )
-                validation_safe = validation["failure_count"] == 0.0
                 stop_training = bool(
                     minimum_reached
-                    and stability["training_stable"]
-                    and validation_safe
-                    and robust_joint_eligible
-                    and robust_checkpoint_available
-                    and early_stop_state["plateau_checks"]
+                    and early_stop_state["safe_validation_streak"]
+                    >= args.early_stop_patience
+                    and early_stop_state["arrival_plateau_checks"]
                     >= args.early_stop_patience
                 )
                 early_stop_check = {
                     "episode": completed_episode,
-                    **stability,
                     "validation_safe": bool(validation_safe),
-                    "robust_joint_eligible": bool(robust_joint_eligible),
-                    "robust_checkpoint_available": bool(
-                        robust_checkpoint_available
+                    "safe_validation_streak": int(
+                        early_stop_state["safe_validation_streak"]
                     ),
-                    "material_improvement": bool(material_improvement),
-                    "plateau_checks": int(
-                        early_stop_state["plateau_checks"]
+                    "arrival_time": current_arrival,
+                    "arrival_improved": bool(arrival_improved),
+                    "best_safe_arrival": early_stop_state[
+                        "best_safe_arrival"
+                    ],
+                    "arrival_plateau_checks": int(
+                        early_stop_state["arrival_plateau_checks"]
+                    ),
+                    "mean_absolute_approx_kl": mean_absolute_kl,
+                    "kl_stable_auxiliary": bool(kl_stable),
+                    "lagrange_multipliers": current_lagrange,
+                    "max_lagrange_increase": float(max_lagrange_increase),
+                    "lagrange_not_surging_auxiliary": bool(
+                        lagrange_not_surging
                     ),
                     "minimum_reached": bool(minimum_reached),
                     "should_stop": bool(stop_training),
@@ -2078,12 +2109,12 @@ def main() -> None:
                 validation["early_stop_check"] = early_stop_check
                 if stop_training:
                     stop_reason = (
-                        "training stable over two "
-                        f"{args.early_stop_window}-episode windows; "
-                        f"zero failures on {len(args.validation_seeds)} "
-                        "validation seeds; robust checkpoint available; "
-                        f"no material improvement for "
-                        f"{early_stop_state['plateau_checks']} checks"
+                        f"zero failures for "
+                        f"{early_stop_state['safe_validation_streak']} "
+                        "consecutive validation checks and no >="
+                        f"{args.early_stop_arrival_improvement:.3f}s "
+                        "safe-arrival improvement for "
+                        f"{early_stop_state['arrival_plateau_checks']} checks"
                     )
                     early_stop_state["stopped"] = True
                     early_stop_state["stop_episode"] = completed_episode
@@ -2152,13 +2183,14 @@ def main() -> None:
             if args.early_stopping:
                 check = early_stop_state["checks"][-1]
                 print(
-                    f"early_stop stable={check['training_stable']} "
-                    f"delta_return={check['return_change']:.3f} "
-                    f"delta_arrival={check['arrival_change']:.3f}s "
                     f"safe_validation={check['validation_safe']} "
-                    f"robust={check['robust_checkpoint_available']} "
-                    f"plateau={check['plateau_checks']}/"
+                    f"safe_streak={check['safe_validation_streak']}/"
                     f"{args.early_stop_patience} "
+                    f"arrival_improved={check['arrival_improved']} "
+                    f"arrival_plateau={check['arrival_plateau_checks']}/"
+                    f"{args.early_stop_patience} "
+                    f"mean_abs_kl={check['mean_absolute_approx_kl']:.6f} "
+                    f"lambda_delta={check['max_lagrange_increase']:.6f} "
                     f"stop={check['should_stop']}",
                     flush=True,
                 )

@@ -103,3 +103,27 @@ evaluation metric, and an efficiency-only episode return is logged separately.
 
 `constraint_mode=none` preserves the original PPO objective and does not create
 a cost critic or multipliers.
+
+## Checkpoint selection and stopping
+
+Return is not used to choose the reported safety-first model. At every
+validation check, checkpoints are ranked by the lexicographic key
+
+```text
+(maximum failure count, mean failure count, all-agent mean arrival time).
+```
+
+The first two entries enforce safety. Arrival time decides only after the
+failure results tie. The all-agent metric is used so an unsafe policy cannot
+appear faster by excluding agents that failed to arrive.
+
+Early stopping is separate from checkpoint selection. Training stops only
+after the minimum episode count when both conditions hold:
+
+1. the maximum failure count is zero for `patience` consecutive validation
+   checks; and
+2. safe-validation arrival time has failed to improve by the configured
+   threshold for `patience` consecutive checks.
+
+Mean absolute approximate KL and the change in the Lagrange multipliers are
+recorded as auxiliary stability diagnostics, not hard stopping gates.
